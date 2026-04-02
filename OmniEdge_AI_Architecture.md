@@ -2,9 +2,9 @@
 
 ## **Executive Summary**
 
-OmniEdge_AI is a multi-modal personal assistant that runs entirely on a single NVIDIA GPU under WSL2. It handles 1080p video, speech transcription, speech synthesis, face recognition, and LLM-based conversation — all concurrently, all on-device.
+OmniEdge_AI is a multi-modal personal assistant designed to run entirely on a single NVIDIA GPU under WSL2. It is designed to handle 1080p video, speech transcription, speech synthesis, face recognition, image generation, and LLM-based conversation — all concurrently, all on-device. The primary hardware target is the **NVIDIA RTX PRO 3000 Blackwell** laptop GPU with **12 GB GDDR6 VRAM**, but the system is designed to scale across different GPU hardware.
 
-The system is optimized for 12 GB (standard tier) but scales from 4 GB (minimal) to 16+ GB (ultra) via automatic GPU profiling at boot. Loading these models at FP16 would require approximately 28 GB. INT4/INT8 quantization (AWQ, SmoothQuant, weight-only INT8) and careful VRAM partitioning bring the total within the 12 GB budget. See **GPU Scalability: Multi-Tier Profile System** for the four hardware tiers.
+The system is optimized for 12 GB (standard tier) but scales from 4 GB (minimal) to 16+ GB (ultra) via automatic GPU profiling at boot. Loading these models at FP16 would require approximately 28 GB. INT4/INT8 quantization (AWQ, SmoothQuant, weight-only INT8) and careful VRAM partitioning are designed to bring the total within the 12 GB budget. See **GPU Scalability: Multi-Tier Profile System** for the four hardware tiers.
 
 The system is a multi-process architecture in C++ and CUDA. Each AI modality — LLM, VLM, STT, TTS, CV — runs as its own binary. This provides fault isolation (one crash does not bring down the pipeline), independent testing, and straightforward GPU stream scheduling.
 
@@ -14,6 +14,8 @@ The IPC design splits into two layers:
 -   **Control Plane** — ZeroMQ PUB/SUB for metadata, events, and orchestration messages.
 
 This document is the implementation reference. It covers VRAM budgeting, quantization methodology, IPC topology, process lifecycle management, model conversion steps, C++ class contracts, and build/test infrastructure.
+
+> **Verification Status:** Most OmniEdge_AI modules are **experimental** — the code compiles and structural tests pass, but the modules have NOT been validated with real models on real hardware. Only the **frontend** (JavaScript SPA) and the **common IPC layer** (ZMQ/SHM wrappers) are verified. All inference backends (LLM, STT, TTS, VLM, ImgGen, CV), GStreamer pipelines, and daemon process management are experimental. Model-specific details (VRAM sizes, quantization methods, parameter counts, latency targets) are **reference configurations** — they describe the intended design, not proven facts. This document uses "is designed to" / "intended to" language for unvalidated claims.
 
 > **Full system architecture diagram:** see [`omniedge_architecture.wsd`](omniedge_architecture.wsd) (PlantUML) — covers every module, IPC flow, data plane, control plane, and browser frontend in a single sequence diagram.
 
@@ -25,7 +27,7 @@ For the reader who wants the essential decisions before the details:
 
 | What | Implementation | Why |
 |:---|:---|:---|
-| 9 independent processes | Each AI modality = separate ELF binary with its own CUDA context | Fault isolation — one CUDA OOM cannot kill another module |
+| 10 independent processes (+ daemon orchestrator) | Each AI modality = separate ELF binary with its own CUDA context | Fault isolation — one CUDA OOM cannot kill another module |
 | IPC: data plane | POSIX shared memory (`mmap`) | Zero kernel crossings after initial `mmap`; no ZMQ serialization on BGR frames (see derivation below) |
 | IPC: control plane | ZeroMQ PUB/SUB | Sub-microsecond loopback latency for small JSON signals; no shared-memory bookkeeping |
 | Model quantization | INT4/INT8 via AWQ + TensorRT-LLM | 28 GB FP16 footprint → 12 GB with < 2% accuracy loss (see derivation below) |
@@ -34,7 +36,7 @@ For the reader who wants the essential decisions before the details:
 | Fault recovery | ZMQ heartbeats + `posix_spawn` watchdog | A crashed module is restarted in < 2 s while all other modules continue running |
 | GPU scheduling | CUDA stream priorities [−5 … 0], no MPS | LLM/STT at −5 (high), CV at 0 (background); avoids MPS complexity on WSL2 |
 | WSL2 DMA path | `cudaHostAlloc` (pinned, not `cudaHostRegister`) | WSL2 WDDM does not expose IOMMU; `cudaHostRegister` on arbitrary `mmap` is unsupported |
-| Configuration | 3-layer: `omniedge_config.yaml` → `config/oe_tuning.hpp` → `common/oe_defaults.hpp` | No hardcoded numbers in module source; new module = YAML block + one binary |
+| Configuration | 4-layer: `omniedge_config.yaml` → `config/oe_tuning.hpp` → `config/oe_platform.hpp` → `common/oe_defaults.hpp` | No hardcoded numbers in module source; new module = YAML block + one binary |
 | GPU profiles | 4 YAML-defined tiers: `minimal` / `balanced` / `standard` / `ultra` | Runs on any 4 GB+ GPU; auto-detected at boot; override with `--profile <tier>` |
 | Dynamic VRAM | Process-level model load/unload via `posix_spawn`/`SIGTERM` | Models not in use are fully unloaded; process exit reclaims VRAM as contiguous block — zero fragmentation |
 
@@ -109,7 +111,7 @@ OmniEdge_AI is structured around seven non-negotiable architectural decisions. U
 
 Each AI modality runs as an independent OS process with its own CUDA context. A corrupted TensorRT engine, a CUDA OOM, or a runaway inference loop in one module cannot corrupt another module's VRAM or stall another module's CUDA stream. The Python/PyTorch monolith alternative offers convenience at the cost of this guarantee: one OOM kills everything.
 
-The practical consequence: the watchdog can kill and restart a crashed VLM node in under 2 seconds while the LLM continues generating tokens and the video pipeline continues at 30 fps. Process-level fault domains make graceful degradation tractable.
+The intended consequence: the watchdog is designed to kill and restart a crashed VLM node in under 2 seconds while the LLM continues generating tokens and the video pipeline continues at 30 fps. Process-level fault domains are designed to make graceful degradation tractable. This recovery time has not yet been measured on real hardware.
 
 ### **2. Data Plane and Control Plane Are Different Channels**
 
@@ -123,7 +125,7 @@ Every inference-heavy module implements a small C++ interface (`ILLMBackend`, `I
 
 ### **4. Declarative Configuration Makes the System Addable**
 
-All port assignments, shm names, engine paths, CUDA stream priorities, and process launch orders live in one YAML file. Naming schemes for ports and shm segments are structured (`/oe.<layer>.<module>[.<qualifier>]`, sequential port allocation) so that any new module can be assigned resources without collisions. Adding hand gesture recognition, for example, requires: claim port 5568, assign shm name `/oe.cv.gesture`, write the node binary, add ~12 lines to `omniedge_config.yaml`. No existing module changes. The daemon picks it up automatically on next startup.
+All port assignments, shm names, engine paths, CUDA stream priorities, and process launch orders live in one YAML file. Naming schemes for ports and shm segments are structured (`/oe.<layer>.<module>[.<qualifier>]`, sequential port allocation) so that any new module can be assigned resources without collisions. Adding hand gesture recognition, for example, requires: claim the next available reserved port (e.g., 5572), assign shm name `/oe.cv.gesture`, write the node binary, add ~12 lines to `omniedge_config.yaml`. No existing module changes. The daemon picks it up automatically on next startup.
 
 ### **5. Graceful Degradation Is Architecture, Not Afterthought**
 
@@ -131,13 +133,14 @@ Every module has a documented failure fallback — what the system presents when
 
 ### **6. Configuration Layers — No Magic Numbers in Source**
 
-Every tunable parameter lives in exactly one of three layers:
+Every tunable parameter lives in exactly one of four layers:
 
 | Layer | Location | When It Changes | Examples |
 |:---|:---|:---|:---|
 | Runtime config | `omniedge_config.yaml` | Per-deployment, no recompilation | Ports, engine paths, thresholds, timeouts, JPEG quality, VAD sensitivity, LLM temperature |
 | Compile-time tuning | `config/oe_tuning.hpp` | Per-hardware-class, requires rebuild | SHM double-buffer slot count, ZMQ HWM, max resolution, CUDA grid dimensions |
 | Platform detection | `config/oe_platform.hpp` | Per-OS/driver, requires rebuild | WSL2 vs native Linux, CUDA compute capability gates, WDDM vs TCC driver path |
+| Runtime defaults | `common/oe_defaults.hpp` | Fallback values when YAML key is missing | All configurable parameters have `constexpr` defaults |
 
 If a YAML key is missing at runtime, the default from `common/oe_defaults.hpp` (`constexpr`) is used instead. No `.cpp` file contains a bare numeric literal for anything that could change between deployments or hardware targets. Architectural constants like port allocation base and SHM naming patterns are `constexpr` in headers.
 
@@ -172,8 +175,8 @@ OmniEdge_AI targets 12 GB VRAM but is designed to run on any GPU from 4 GB upwar
 |:---|:---|:---|:---|:---|:---|
 | `minimal` | 4 GB | STT + LLM + TTS + Daemon + WS | Qwen 2.5 1.5B INT4 (~1.2 GB) | Whisper Small INT8 (~0.5 GB) | Disabled |
 | `balanced` | 8 GB | + Video Ingest + Face Recognition; VLM on-demand | Qwen 2.5 3B INT4 (~2.0 GB) | Whisper V3 Turbo INT8 (1.5 GB) | FR only |
-| `standard` | 12 GB | All 9 modules | Qwen 2.5 7B INT4-AWQ (4.3 GB) | Whisper V3 Turbo INT8 (1.5 GB) | Full |
-| `ultra` | 16 GB | All 9 modules + extended context | Qwen 2.5 7B INT4-AWQ (4.3 GB) | Whisper V3 Turbo INT8 (1.5 GB) | Full + FP16 KV |
+| `standard` | 12 GB | All 9 core modules; ImgGen on-demand | Qwen 2.5 7B INT4-AWQ (4.3 GB) | Whisper V3 Turbo INT8 (1.5 GB) | Full |
+| `ultra` | 16 GB | All 10 modules + extended context | Qwen 2.5 7B INT4-AWQ (4.3 GB) | Whisper V3 Turbo INT8 (1.5 GB) | Full + FP16 KV |
 
 ### VRAM Budget per Tier
 
@@ -186,10 +189,13 @@ OmniEdge_AI targets 12 GB VRAM but is designed to run on any GPU from 4 GB upwar
 | Face Recognition | — | 0.50 GB | 0.50 GB | 0.50 GB |
 | Background Blur | — | — | 0.50 GB | 0.50 GB |
 | VLM (Moondream2) | — | on-demand¹ | 2.45 GB | 2.45 GB |
+| ImgGen (FLUX.1-schnell) | — | — | on-demand² | on-demand² |
 | System / WSL2 | 1.00 GB | 1.00 GB | 1.50 GB | 1.50 GB |
 | **Total** | **~3.0 GB** | **~5.5 GB** | **~12.0 GB** | **~12.9 GB** |
 
 > ¹ `balanced` loads Moondream2 only when the user triggers `describe_scene`, processes one frame, then `posix_spawn` exits and frees VRAM.
+>
+> ² FLUX.1-schnell INT8 requires ~4.50 GB VRAM. On `standard` and `ultra` tiers, the daemon evicts lower-priority modules (BackgroundBlur, FaceRecognition, VLM) before spawning ImgGen, then restores them after generation completes. ImgGen is never resident — it is always on-demand with immediate eviction after use.
 
 ### Runtime GPU Probe and Auto-Selection
 
@@ -340,9 +346,10 @@ profiles:
     stt:
       engine_dir: "/models/engines/whisper-v3-turbo-int8"
     cv: { background_blur: true, face_recognition: true, vlm: always }
+    img_gen: on_demand         # FLUX.1-schnell: 4.5 GB, evicts BB+FR+VLM before spawn
 
   ultra:                      # ── 16+ GB ────────────────────────────────────────
-    modules: [video_ingest, audio_ingest, face_recognition, background_blur, vlm, stt, llm, tts, ws_bridge]
+    modules: [video_ingest, audio_ingest, face_recognition, background_blur, vlm, stt, llm, tts, flux_img_gen, ws_bridge]
     llm:
       engine_dir: "/models/engines/qwen2.5-7b-int4"
       max_seq_len: 8192       # doubled context window
@@ -364,6 +371,8 @@ The daemon publishes `module_status` events on boot. The JS frontend disables un
 | Background blur | — | — | ✓ | ✓ |
 | Face name display | — | ✓ | ✓ | ✓ |
 | Describe scene | — | on-demand | ✓ | ✓ |
+| Image generation | — | — | on-demand | on-demand |
+| Image adjustments | — | — | ✓ | ✓ |
 | Context window | 2,048 tok | 3,072 tok | 4,096 tok | 8,192 tok |
 
 ---
@@ -406,7 +415,8 @@ When the daemon needs VRAM for a higher-priority or on-demand module, it evicts 
 | 3 | KokoroTTSNode | Only if no pending synthesis |
 | 2 | MoondreamVLMNode | Yes (often on-demand already) |
 | 1 | FaceRecognitionNode | Yes |
-| 0 (lowest) | BackgroundBlurNode | Yes (visual effect only) |
+| 0 | BackgroundBlurNode | Yes (visual effect only) |
+| -1 (lowest) | FLUXImgGenNode | Yes — on-demand, 4.5 GB VRAM, always evicted first |
 
 Eviction rules:
 
@@ -434,7 +444,7 @@ CUDA does provide mitigation tools for in-process model management if needed in 
 
 ## **VRAM Allocation**
 
-Every megabyte is accounted for. The allocation below assumes TensorRT for GPU-heavy models and ONNX Runtime for Kokoro (TTS) and Silero (VAD). The numbers come from actual engine builds, not parameter-count estimates.
+Every megabyte is accounted for. The allocation below assumes TensorRT for GPU-heavy models and ONNX Runtime for Kokoro (TTS) and Silero (VAD). The numbers are reference values derived from published model specifications, parameter-count calculations, and documented engine build outputs. They represent the intended design and have not yet been validated on the target RTX PRO 3000 Blackwell hardware.
 
 **1. Qwen 2.5 7B (Core LLM):** 7.61B parameters. FP16 requires approximately 16.1 GB and does not fit within the 12 GB budget. INT4 via AutoAWQ compresses weights to 3.73–4.3 GB. The system runs this through TensorRT-LLM, which maps INT4 ops to Tensor Cores. Qwen 2.5 uses Grouped Query Attention (GQA), which cuts KV cache memory by approximately 4× compared to full Multi-Head Attention (MHA) — critical when the cache budget is only 1.15 GB.
 
@@ -911,7 +921,7 @@ Every message on the ZMQ bus is a JSON string with a mandatory `"v"` (version) f
 {"v":1,"type":"vad_status","speaking":false,"silence_ms":1500}
 ```
 
-#### `transcription` — WhisperSTTNode → QwenLLM
+#### `transcription` — WhisperSTTNode → Daemon
 
 | Field | Type | Required | Description |
 |:---|:---|:---:|:---|
@@ -975,9 +985,12 @@ Every message on the ZMQ bus is a JSON string with a mandatory `"v"` (version) f
 | `type` | string | ✓ | `"llm_response"` |
 | `token` | string | ✓ | Next generated token (or `""` on final msg) |
 | `finished` | bool | ✓ | `true` on the last message of a generation |
+| `sentence_boundary` | bool | | `true` when the token completes a sentence (`.`, `!`, `?` followed by whitespace). The daemon uses this to trigger TTS synthesis for the completed sentence (state machine transition T10: PROCESSING → SPEAKING) |
 
 ```json
 {"v":1,"type":"llm_response","token":"Hello","finished":false}
+{"v":1,"type":"llm_response","token":".","finished":false,"sentence_boundary":true}
+{"v":1,"type":"llm_response","token":"","finished":true}
 ```
 
 #### `tts_audio` — KokoroTTSNode → WebSocketBridge
@@ -1014,16 +1027,45 @@ Every message on the ZMQ bus is a JSON string with a mandatory `"v"` (version) f
 |:---|:---|:---:|:---|
 | `v` | int | ✓ | Schema version (1) |
 | `type` | string | ✓ | `"ui_command"` |
-| `action` | string | ✓ | Command name: `"push_to_talk"`, `"disable_webcam"`, `"text_input"`, `"describe_scene"`, `"register_face"`, `"cancel_generation"`, `"flush_tts"`, `"stop_playback"` |
+| `action` | string | ✓ | Command name (see action table below) |
 | `state` | bool | | For toggle actions (PTT, webcam) |
-| `text` | string | | For `text_input` action |
+| `text` | string | | For `text_input` and `image_gen` actions |
 | `name` | string | | For `register_face` action |
 | `shm` | string | | For `register_face` — temp shm with image data |
+| `mode` | string | | For `set_mode` — target mode name |
+| `brightness` | int | | For `set_image_adjust` — range [-100, +100] |
+| `contrast` | float | | For `set_image_adjust` — range [0.5, 3.0] |
+| `saturation` | float | | For `set_image_adjust` — range [0.0, 2.0] |
+| `sharpness` | int | | For `set_image_adjust` — range [0, 10] |
+| `shapes` | array | | For `update_shapes` — shape definitions from canvas overlay |
+
+**UI command actions:**
+
+| Action | Parameters | Consumed By | Description |
+|:---|:---|:---|:---|
+| `push_to_talk` | `state: bool` | Daemon | PTT press (`true`) or release (`false`) |
+| `text_input` | `text: string` | Daemon | Text chat message (bypasses STT) |
+| `describe_scene` | — | Daemon | Trigger VLM scene description |
+| `register_face` | `name, shm` | FaceRecognition | Register a new face from image data |
+| `cancel_generation` | — | QwenLLM | Stop LLM token generation (barge-in) |
+| `flush_tts` | — | KokoroTTS | Clear TTS synthesis queue |
+| `stop_playback` | — | Frontend (via bridge) | Stop audio playback in browser |
+| `tts_complete` | — | Daemon | Frontend signals all TTS audio finished playing (triggers T19: SPEAKING → IDLE) |
+| `disable_webcam` | `state: bool` | VideoIngest | Enable/disable webcam capture |
+| `set_image_adjust` | `brightness, contrast, saturation, sharpness` | BackgroundBlur | ISP-style image adjustments applied before blur compositing |
+| `update_shapes` | `shapes: array` | BackgroundBlur | Canvas shape overlay definitions (rectangles, circles, lines, freehand) composited into the blurred background region |
+| `set_mode` | `mode: string` | Daemon | Switch system mode (`chat`, `vision`, `image_gen`) — triggers VRAM eviction/spawn as needed |
+| `image_gen` | `text: string` | Daemon | Generate an image from text prompt (dispatched to FLUXImgGenNode) |
 
 ```json
 {"v":1,"type":"ui_command","action":"push_to_talk","state":true}
 {"v":1,"type":"ui_command","action":"text_input","text":"What do you see?"}
 {"v":1,"type":"ui_command","action":"register_face","name":"Admin","shm":"/oe.vid.register"}
+{"v":1,"type":"ui_command","action":"tts_complete"}
+{"v":1,"type":"ui_command","action":"set_image_adjust","brightness":10,"contrast":1.2,"saturation":1.0,"sharpness":3}
+{"v":1,"type":"ui_command","action":"update_shapes","shapes":[{"type":"rect","x":100,"y":200,"w":300,"h":150,"color":"#ff0000"}]}
+{"v":1,"type":"ui_command","action":"set_mode","mode":"image_gen"}
+{"v":1,"type":"ui_command","action":"image_gen","text":"A sunset over mountains"}
 ```
 
 #### `module_status` — OmniEdgeDaemon → WebSocketBridge
@@ -1071,6 +1113,55 @@ Published by each module on its PUB socket after initialization completes (engin
 
 ```json
 {"v":1,"type":"module_ready","module":"whisper_stt","pid":12344}
+```
+
+#### `image_gen_prompt` — OmniEdgeDaemon → FLUXImgGenNode
+
+Published by the daemon when the user requests image generation via the `image_gen` UI command. FLUXImgGenNode subscribes to the daemon's PUB port (5571) and filters for this topic.
+
+| Field | Type | Required | Description |
+|:---|:---|:---:|:---|
+| `v` | int | ✓ | Schema version (1) |
+| `type` | string | ✓ | `"image_gen_prompt"` |
+| `prompt` | string | ✓ | Text description of the image to generate |
+| `width` | int | | Output width (default: 1024) |
+| `height` | int | | Output height (default: 1024) |
+| `steps` | int | | Inference steps (default: 4 for FLUX.1-schnell) |
+
+```json
+{"v":1,"type":"image_gen_prompt","prompt":"A sunset over mountains","width":1024,"height":1024,"steps":4}
+```
+
+#### `generated_image` — FLUXImgGenNode → WebSocketBridge
+
+Published when image generation completes. The bridge relays the JPEG image to the frontend as a binary WebSocket message on the `/chat` channel (base64-encoded in JSON) or as a separate binary frame.
+
+| Field | Type | Required | Description |
+|:---|:---|:---:|:---|
+| `v` | int | ✓ | Schema version (1) |
+| `type` | string | ✓ | `"generated_image"` |
+| `shm` | string | ✓ | POSIX shm name containing JPEG data |
+| `size` | int | ✓ | JPEG byte count |
+| `prompt` | string | ✓ | Original prompt (echoed back for UI display) |
+
+```json
+{"v":1,"type":"generated_image","shm":"/oe.cv.imggen.jpeg","size":245760,"prompt":"A sunset over mountains"}
+```
+
+#### `daemon_state` — OmniEdgeDaemon → WebSocketBridge → Frontend
+
+Published on every state machine transition. The bridge relays this to the frontend so the UI can update its state indicators (IDLE, LISTENING, PROCESSING, etc.).
+
+| Field | Type | Required | Description |
+|:---|:---|:---:|:---|
+| `v` | int | ✓ | Schema version (1) |
+| `type` | string | ✓ | `"daemon_state"` |
+| `state` | string | ✓ | Current state: `"idle"`, `"listening"`, `"processing"`, `"vision_processing"`, `"speaking"`, `"error"` |
+| `module` | string | | Module name (only present when `state` is `"error"`) |
+
+```json
+{"v":1,"type":"daemon_state","state":"listening"}
+{"v":1,"type":"daemon_state","state":"error","module":"whisper_stt"}
 ```
 
 ## **Watchdog and Heartbeat Mechanisms**
@@ -1467,7 +1558,7 @@ GStreamer PCM → appsink callback → VAD filter (CPU) → if speech: write to 
 2.  Each 30 ms PCM chunk passes through Silero VAD on CPU.
 3.  **If speech probability ≥ 0.5:** Write chunk to `/oe.aud.ingest`, publish `{"type":"audio_chunk","vad":"speech"}` on ZMQ. WhisperSTTNode picks it up and transcribes.
 4.  **If speech probability < 0.5:** Discard the chunk. Do not write to shm. No ZMQ message.
-5.  **End-of-utterance detection:** If VAD outputs < 0.5 for 1.5 consecutive seconds after at least one speech chunk was detected, AudioIngestNode publishes `{"type":"vad_status","speaking":false,"silence_duration_ms":1500}`. The daemon uses this to auto-transition from LISTENING → PROCESSING if the user hasn't released PTT yet.
+5.  **End-of-utterance detection:** If VAD outputs < 0.5 for 1.5 consecutive seconds after at least one speech chunk was detected, AudioIngestNode publishes `{"type":"vad_status","speaking":false,"silence_ms":1500}`. The daemon uses this to auto-transition from LISTENING → PROCESSING if the user hasn't released PTT yet.
 6.  User releases PTT → daemon sends `{"action":"stop_audio"}` → final transcription is collected → PROCESSING state.
 
 ### Integration With the Conversation State Machine
@@ -1534,15 +1625,15 @@ Each module configures its CUDA stream with an appropriate priority. CUDA stream
 | **-5** (highest) | QwenLLMNode, WhisperSTTNode | Conversational latency is user-facing. Every millisecond of LLM TTFT and STT delay is directly perceptible |
 | **-3** (medium) | KokoroTTSNode | TTS runs after the LLM emits a sentence — slight delay is masked by the reading speed of the text bubble |
 | **-1** (low) | MoondreamVLMNode | On-demand only (user clicks "Describe Scene") — not in the critical path |
-| **0** (lowest) | BackgroundBlurNode, FaceRecognitionNode | Background tasks. Users tolerate 1–2 dropped video frames; they do not tolerate a 200 ms delay in the assistant's response |
+| **0** (lowest) | BackgroundBlurNode, FaceRecognitionNode, FLUXImgGenNode | Background tasks and on-demand image generation. ImgGen is always on-demand and never in the critical conversational path |
 
 ```cpp
 // In each module's initialize():int priority_low, priority_high;cudaDeviceGetStreamPriorityRange(&priority_low, &priority_high);// priority_high is the most negative (highest priority)cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking, priority_high); // for LLM/STT
 ```
 
-### End-to-End Latency Budget (Standard Tier, 12 GB)
+### End-to-End Latency Budget (Standard Tier, 12 GB) — Design Target
 
-Target: **< 2.0 seconds** from user stops speaking to first audible assistant word.
+Target: **< 2.0 seconds** from user stops speaking to first audible assistant word. These are reference values based on published model benchmarks, not measured on the target hardware.
 
 | Stage | Component | Target Latency | Notes |
 |:---|:---|:---|:---|
@@ -1663,47 +1754,44 @@ sequenceDiagram
 
 ## **Audio and Video Ingestion via GStreamer**
 
-WSL2 does not expose USB devices to the Linux guest by default. Rather than require usbip or custom kernel builds, GStreamer runs on the Windows host to capture the webcam and microphone, then streams over TCP to the WSL2 consumer.
+WSL2 does not expose USB devices to the Linux guest by default. The **usbipd-win** utility solves this by attaching the USB webcam from the Windows host into the WSL2 kernel, making it appear as a native `/dev/video*` V4L2 device. This is the video capture method — direct V4L2 capture eliminates any Windows-side GStreamer pipeline, avoids H.264 encode/decode overhead, and removes TCP buffering latency.
 
-## **Windows Host Video Pipeline**
+For audio, the microphone is captured on the Windows host via `wasapi2src` (WASAPI 2.0) and streamed over TCP to WSL2. USB audio passthrough via usbipd is unreliable on many devices, so audio retains the TCP approach.
 
-The Windows host runs a GStreamer pipeline that captures from the webcam via ksvideosrc (WDM Kernel Streaming), scales/converts the video, encodes to H.264, and pushes over TCP:
+### **Video Capture: V4L2 via usbipd**
 
-```bash
-gst-launch-1.0 ksvideosrc \
-  ! videoconvert \
-  ! videoscale \
-  ! video/x-raw,width=1920,height=1080,framerate=30/1 \
-  ! x264enc tune=zerolatency bitrate=16000000 speed-preset=superfast \
-  ! h264parse \
-  ! tcpserversink host=0.0.0.0 port=5000
+The USB webcam is attached to WSL2 using `usbipd-win`. From **Windows PowerShell (Admin)**:
+
+```powershell
+usbipd list                            # Find the webcam BUSID (e.g. 1-3)
+usbipd bind --busid <BUSID>            # One-time bind
+usbipd attach --wsl --busid <BUSID>    # Attach to WSL2 (re-run after WSL restart)
 ```
 
-The `tune=zerolatency` flag on x264enc is critical. Without it, the encoder holds frames in a buffer to compute B-frames, adding 100+ ms of latency. With it, each frame is output immediately.
-
-## **WSL2 Video Consumer**
-
-The VideoIngestNode in WSL2 connects to the host's TCP stream, decodes H.264, and delivers raw BGR frames to an appsink:
+After attachment, the webcam appears as `/dev/video0` inside WSL2. Most USB webcams over usbipd only support MJPG natively — requesting raw formats via `S_FMT` fails with "Device busy". The VideoIngestNode captures MJPG, decodes via `jpegdec`, and converts to BGR:
 
 ```bash
-tcpclientsrc host=<WINDOWS_HOST_IP> port=5000 \
-  ! h264parse \
-  ! avdec_h264 \
-  ! videoconvert \
-  ! video/x-raw,format=BGR \
-  ! appsink name=omniedge_video_sink drop=1 max-buffers=2
+v4l2src device=/dev/video0 \
+  ! image/jpeg,width=1920,height=1080 \
+  ! jpegdec ! videoconvert \
+  ! video/x-raw,format=BGR,width=1920,height=1080 \
+  ! appsink name=video_sink drop=true max-buffers=2
 ```
 
-`drop=1 max-buffers=2` tells GStreamer to discard old frames if the C++ callback cannot keep up — same philosophy as `ZMQ_CONFLATE`.
+`drop=true max-buffers=2` tells GStreamer to discard old frames if the C++ callback cannot keep up — same philosophy as `ZMQ_CONFLATE`. Direct V4L2 capture avoids H.264 encode/decode overhead and TCP buffering, keeping frame delivery latency under 5 ms.
 
-In the callback, the code calls `gst_base_sink_get_last_sample()`, maps the GstBuffer, memcpy's the BGR payload into the pre-allocated POSIX shared memory slot, and fires the ZMQ notification.
+In the callback, the code maps the GstBuffer, memcpy's the BGR payload into the pre-allocated POSIX shared memory slot, and fires the ZMQ notification.
+
+The `v4l2_device` field in the YAML config specifies which device to capture from (e.g., `/dev/video0`).
+
+**Note:** `usbipd attach` must be re-run each time WSL2 restarts. The `usbipd bind` step is persistent across reboots.
 
 ### GStreamer C++ Implementation — Video Callback
 
-The following shows the actual C++ code pattern for the video appsink callback and GStreamer lifecycle management. This is what `VideoIngestNode::initialize()` and the appsink callback look like:
+The following shows the actual C++ code pattern for the video appsink callback and GStreamer lifecycle management. VideoIngestNode captures from the usbipd-attached V4L2 webcam:
 
 ```cpp
-// modules/video_ingest/video_ingest_node.cpp — GStreamer integration
+// modules/gstreamer_ingest/video_ingest_node.cpp — GStreamer integration
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 
@@ -1712,14 +1800,18 @@ namespace omniedge {
 void VideoIngestNode::initialize() {
     gst_init(nullptr, nullptr);
 
-    // Build pipeline from string — GStreamer parses and links elements
+    // Build V4L2 MJPG pipeline from config.
+    // Most USB webcams over usbipd only support MJPG natively.
     GError* error = nullptr;
-    const std::string pipelineStr = std::format(
-        "tcpclientsrc host={} port={} ! "
-        "h264parse ! avdec_h264 ! videoconvert ! "
-        "video/x-raw,format=BGR ! "
-        "appsink name=video_sink emit-signals=true drop=true max-buffers=2",
-        config_.tcpHost, config_.tcpPort);
+    std::string pipelineStr = std::format(
+        "v4l2src device={} "
+        "! image/jpeg,width={},height={} "
+        "! jpegdec ! videoconvert "
+        "! video/x-raw,format=BGR,width={},height={} "
+        "! appsink name=video_sink drop=true max-buffers=2",
+        config_.v4l2Device,
+        config_.frameWidth, config_.frameHeight,
+        config_.frameWidth, config_.frameHeight);
 
     pipeline_ = gst_parse_launch(pipelineStr.c_str(), &error);
     if (!pipeline_ || error) {
@@ -1910,16 +2002,15 @@ VideoIngestNode::~VideoIngestNode() {
 
 | Element | Role | Key Properties | Failure Mode |
 |:---|:---|:---|:---|
-| `tcpclientsrc` | TCP client — reads H.264 or raw PCM stream | `host`, `port` | Connection refused → ERROR bus message |
-| `h264parse` | Parses H.264 NAL units into frames | (none) | Corrupt NAL → drops frame, continues |
-| `avdec_h264` | Decodes H.264 to raw video (libavcodec) | (none) | Decode error → drops frame, continues |
+| `v4l2src` | V4L2 webcam capture via usbipd | `device=/dev/video0` | No device → ERROR bus message |
+| `jpegdec` | Decodes MJPG frames from webcam | (none) | Corrupt JPEG → drops frame, continues |
+| `tcpclientsrc` | TCP client — reads raw PCM audio stream from Windows host | `host`, `port` | Connection refused → ERROR bus message |
 | `videoconvert` | Pixel format conversion (NV12/YUV → BGR) | (none) | Always succeeds if input is valid video |
 | `appsink` | Delivers frames to C++ callback | `emit-signals=true`, `drop=true`, `max-buffers=2` | Callback returns `GST_FLOW_ERROR` → pipeline stops |
 | `wasapi2src` | Windows mic capture (WASAPI 2.0) | (none — uses default device) | No device → ERROR bus message |
 | `audioconvert` | Sample format conversion (S16LE → F32LE) | (none) | Always succeeds if input is valid audio |
 | `audioresample` | Sample rate conversion (48 kHz → 16 kHz) | (none) | Always succeeds if input is valid audio |
-| `x264enc` | H.264 encoder (host-side) | `tune=zerolatency`, `bitrate`, `speed-preset` | CPU overload → drops quality, not frames |
-| `tcpserversink` | TCP server — pushes encoded stream | `host`, `port` | Port in use → ERROR bus message |
+| `tcpserversink` | TCP server — pushes audio stream (Windows host) | `host`, `port` | Port in use → ERROR bus message |
 
 ## **Audio Ingestion Pipeline**
 
@@ -1957,7 +2048,7 @@ The `max-buffers=4` setting is slightly higher than the video pipeline's `max-bu
 
 ## **Inference Engine and C++ Runtime**
 
-Sub-300 ms LLM time-to-first-token and sub-400 ms STT latency are required. PyTorch and llama.cpp cannot meet these targets on a 12 GB GPU under full system load with this many concurrent models. TensorRT-LLM is the inference backend for all GPU-heavy models; ONNX Runtime handles the lighter ones.
+The design targets sub-300 ms LLM time-to-first-token and sub-400 ms STT latency. PyTorch and llama.cpp are not expected to meet these targets on a 12 GB GPU under full system load with this many concurrent models. TensorRT-LLM is the intended inference backend for all GPU-heavy models; ONNX Runtime is intended for the lighter ones. These latency targets are reference values based on published benchmarks and have not yet been validated on the target hardware.
 
 ## **TensorRT-LLM: Qwen 2.5 7B and Moondream2**
 
@@ -1983,13 +2074,48 @@ The C++ STT process receives PCM chunks from shared memory, computes log-mel spe
 
 **YOLOv8-seg (Background Blur):** Runs person segmentation to produce a binary mask. The C++ node applies Gaussian blur to the background region using OpenCV's CUDA module (cv::cuda), composites the sharp foreground over the blurred background, and JPEG-encodes the result via nvJPEG — all on GPU. The compressed frame goes to shared memory for the WebSocket bridge to serve to the browser.
 
+### Image Adjustments (ISP-Style Processing)
+
+BackgroundBlurNode applies four image adjustments to every frame before segmentation and blur compositing. These function as a software ISP (Image Signal Processor), transforming raw BGR frames from the camera to user preference. All four operations run on the GPU via OpenCV CUDA:
+
+| Adjustment | Method | Range | Default | GPU Implementation |
+|:---|:---|:---|:---|:---|
+| **Brightness** | Per-pixel additive offset | [-100, +100] | 0 | `cv::cuda::add(frame, Scalar(b,b,b))` |
+| **Contrast** | Per-pixel multiplicative scale around mean | [0.5, 3.0] | 1.0 | `cv::cuda::multiply(frame - mean, contrast) + mean` |
+| **Saturation** | HSV S-channel scale | [0.0, 2.0] | 1.0 | BGR→HSV on GPU, scale S channel, HSV→BGR |
+| **Sharpness** | Unsharp mask (original + gain × (original - blurred)) | [0, 10] | 0 | `cv::cuda::GaussianBlur` + weighted add |
+
+The frontend sends `set_image_adjust` UI commands via WebSocket when the user moves sliders. BackgroundBlurNode subscribes to `ui_command` on port 5570 and updates its adjustment parameters atomically. The ISP pipeline runs before YOLOv8-seg inference, so the segmentation model sees the adjusted image.
+
+### Canvas Shape Overlay
+
+The frontend provides a drawing layer (`<canvas>` element) overlaid on the video feed. Users can draw rectangles, circles, lines, and freehand paths. Shape definitions are sent to BackgroundBlurNode via `update_shapes` UI commands.
+
+**Rendering rule:** Shapes are composited into the **blurred background region only** — foreground pixels inside the person mask are never overwritten. This ensures the user's face and body are always visible, even if a shape overlaps them. Rendering uses OpenCV's drawing primitives (`cv::rectangle`, `cv::circle`, `cv::line`, `cv::polylines`). Overhead is designed to be less than 0.5 ms at 30 fps for up to 50 shapes.
+
+**Coordinate mapping:** The frontend canvas uses CSS-scaled coordinates. Before sending to the backend, JavaScript remaps coordinates from the CSS canvas dimensions to the native 1920x1080 frame resolution.
+
+### FLUX.1-schnell Image Generation
+
+FLUXImgGenNode is an **on-demand** inference module that generates images from text prompts. It uses FLUX.1-schnell (INT8, ~4.50 GB VRAM) via TensorRT. Because it requires more VRAM than any other single module, it is never resident — the daemon evicts lower-priority modules before spawning it and restores them after generation completes.
+
+**Flow:** User sends `image_gen` UI command → daemon computes eviction set → SIGTERM evictable modules → `posix_spawn("omniedge_img_gen")` → wait `module_ready` → publish `image_gen_prompt` → ImgGen processes → publishes `generated_image` → daemon SIGTERMs ImgGen → re-spawns evicted modules.
+
 ## **Frontend and WebSocket Bridge**
 
-The browser UI connects to the C++ backend via two WebSocket channels on port 9001: one for binary video frames, one for JSON control messages. The backend uses uWebSockets (C++ library).34,35
+The browser UI connects to the C++ backend via **three WebSocket channels** on port 9001, each serving a distinct data type. The backend uses uWebSockets (C++ library).
 
-Video flow: BackgroundBlurNode writes JPEG to shm → ZMQ notification → WebSocketBridge reads shm → sends binary over WS → browser renders to canvas at 30 fps via Blob/createObjectURL.34
+| Channel | URL | Data Type | Direction | Purpose |
+|:---|:---|:---|:---|:---|
+| **Video** | `ws://localhost:9001/video` | Binary (`ArrayBuffer`) | Server → Client | JPEG frames from BackgroundBlurNode (or raw video if blur is down) |
+| **Audio** | `ws://localhost:9001/audio` | Binary (`ArrayBuffer`) | Server → Client | PCM float32 audio from KokoroTTSNode for browser playback |
+| **Chat** | `ws://localhost:9001/chat` | JSON text | Bidirectional | Commands (PTT, describe_scene, text_input, set_image_adjust, update_shapes, set_mode) and events (transcription, llm_response, module_status, identity, vlm_description, face_registered, generated_image, daemon_state, error) |
 
-Control flow: Browser sends JSON commands (`{"action":"push_to_talk","state":true}`) over the /chat WS path. The bridge publishes these on ZMQ topic `ui_command` for the daemon and relevant modules to consume.
+Video flow: BackgroundBlurNode writes JPEG to shm → ZMQ notification → WebSocketBridge reads shm → sends binary over `/video` WS → browser renders to `<canvas>` at 30 fps via `Blob`/`createObjectURL`.
+
+Audio flow: KokoroTTSNode writes PCM to shm → ZMQ notification → WebSocketBridge reads shm → sends binary over `/audio` WS → browser decodes PCM float32 → `AudioContext` at 24 kHz for streaming playback.
+
+Control flow: Browser sends JSON commands (`{"action":"push_to_talk","state":true}`) over the `/chat` WS path. The bridge publishes these on ZMQ topic `ui_command` for the daemon and relevant modules to consume. The bridge also relays ZMQ events (llm_response tokens, module_status, identity, vlm_description) back to the browser as JSON on the same `/chat` channel.
 
 ## **Codebase Structure and Build System**
 
@@ -2004,39 +2130,331 @@ The OmniEdgeDaemon is a lightweight C++ process that manages the other binaries.
 The daemon reads a single YAML configuration file at startup instead of hardcoding module descriptors in C++. Adding a new module requires only a config change — no recompilation.
 
 ```yaml
-# omniedge_config.yaml — Master configuration for OmniEdgeDaemondaemon:  watchdog_poll_ms: 1000  log_socket: "/tmp/omniedge_log.sock"    # Unix domain socket for centralized logging  zmq_pub: "tcp://127.0.0.1:5571"      # Publishes module_status + llm_prompt  zmq_sub:                              # Subscribes to multiple publishers    - "tcp://127.0.0.1:5570"           # ui_command from WS Bridge    - "tcp://127.0.0.1:5563"           # transcription from WhisperSTT    - "tcp://127.0.0.1:5566"           # identity from FaceRecognition    - "tcp://127.0.0.1:5562"           # vlm_description from MoondreamVLM    - "tcp://127.0.0.1:5556"           # vad_status from AudioIngest  state_machine:    vad_silence_threshold_ms: 800       # Auto end-of-utterance after 800 ms silence    barge_in_enabled: true    llm_generation_timeout_s: 60        # Max wait for LLM before declaring timeout    vlm_timeout_s: 30                   # Max wait for VLM on-demand result  heartbeat:    ivl_ms: 1000                        # ZMTP PING interval    timeout_ms: 5000                    # Peer dead if no PONG within this    ttl_ms: 10000                       # Tell peer: assume I'm dead after this  module_ready_timeout_s: 30            # Wait for module_ready before proceeding without itmodules:  video_ingest:    binary: "./build/bin/omniedge_video_ingest"    args: ["--config", "omniedge_config.yaml"]    zmq_pub: "tcp://127.0.0.1:5555"    shm_name: "/oe.vid.ingest"    max_restarts: 5    priority: "critical"                # System cannot function without video  audio_ingest:    binary: "./build/bin/omniedge_audio_ingest"    args: ["--config", "omniedge_config.yaml"]    zmq_pub: "tcp://127.0.0.1:5556"    shm_name: "/oe.aud.ingest"    max_restarts: 5    vad:      model_path: "./models/silero_vad.onnx"      threshold: 0.5      silence_duration_ms: 800  background_blur:    binary: "./build/bin/omniedge_bg_blur"    zmq_sub: "tcp://127.0.0.1:5555"    zmq_pub: "tcp://127.0.0.1:5567"    shm_input: "/oe.vid.ingest"    shm_output: "/oe.cv.blur.jpeg"    engine_path: "./models/trt_engines/yolov8n-seg.engine"    jpeg_quality: 85                    # JPEG encode quality (0–100)    blur_kernel_size: 51                # Gaussian blur kernel (must be odd)    blur_sigma: 25.0                    # Gaussian blur sigma    cuda_stream_priority: 0             # Lowest priority    max_restarts: 5  face_recognition:    binary: "./build/bin/omniedge_face_recog"    zmq_sub: "tcp://127.0.0.1:5555"    zmq_pub: "tcp://127.0.0.1:5566"    shm_input: "/oe.vid.ingest"    model_pack_path: "./models/InspireFace/Megatron_TRT"    recognition_threshold: 0.45    faces_db: "./data/known_faces.sqlite"    frame_subsample: 3                  # Process every 3rd frame    cuda_stream_priority: 0    max_restarts: 5  whisper_stt:    binary: "./build/bin/omniedge_stt"    zmq_sub: "tcp://127.0.0.1:5556"    zmq_pub: "tcp://127.0.0.1:5563"    shm_input: "/oe.aud.ingest"    encoder_engine: "./models/trt_engines/whisper-turbo/encoder"    decoder_engine: "./models/trt_engines/whisper-turbo/decoder"    cuda_stream_priority: -5            # Highest priority    max_restarts: 3    hallucination_filter:      no_speech_prob_threshold: 0.6     # Discard if P(no_speech) > this      min_avg_logprob: -1.0             # Discard if avg_logprob < this      max_consecutive_repeats: 3        # Suppress after N identical outputs  qwen_llm:    binary: "./build/bin/omniedge_llm"    zmq_sub: "tcp://127.0.0.1:5571"      # Subscribes ONLY to daemon (llm_prompt topic)    zmq_pub: "tcp://127.0.0.1:5561"    engine_dir: "./models/trt_engines/qwen2.5-7b-awq"    tokenizer_dir: "./models/qwen2.5-7b-instruct-awq"    max_input_len: 2048    max_output_len: 500    temperature: 0.7    top_p: 0.9    cuda_stream_priority: -5            # Highest priority    max_restarts: 3  kokoro_tts:    binary: "./build/bin/omniedge_tts"    zmq_sub: "tcp://127.0.0.1:5561"      # Subscribes to llm_response from QwenLLM    zmq_pub: "tcp://127.0.0.1:5565"    shm_output: "/oe.aud.tts"    onnx_model: "./models/onnx/kokoro-v1_0-int8.onnx"    voice_dir: "./models/kokoro/voices"    default_voice: "af_heart"    cuda_stream_priority: -3    max_restarts: 5  moondream_vlm:    binary: "./build/bin/omniedge_vlm"    zmq_sub: "tcp://127.0.0.1:5555"    zmq_pub: "tcp://127.0.0.1:5562"    shm_input: "/oe.vid.ingest"    vision_engine: "./models/trt_engines/moondream2_vision.engine"    python_encoder: "./scripts/encode_moondream_image.py"    cuda_stream_priority: -1    max_restarts: 3  websocket_bridge:    binary: "./build/bin/omniedge_ws_bridge"    zmq_sub:                              # Subscribes to multiple publishers      - "tcp://127.0.0.1:5567"           # blurred_frame from BackgroundBlur      - "tcp://127.0.0.1:5565"           # tts_audio from KokoroTTS      - "tcp://127.0.0.1:5561"           # llm_response from QwenLLM      - "tcp://127.0.0.1:5562"           # vlm_description from MoondreamVLM      - "tcp://127.0.0.1:5571"           # module_status from Daemon      - "tcp://127.0.0.1:5566"           # face_registered from FaceRecognition    zmq_pub: "tcp://127.0.0.1:5570"    ws_port: 9001    max_restarts: 5    priority: "critical"# Launch order (daemon respects this sequence):launch_order:  - video_ingest  - audio_ingest  - background_blur  - face_recognition  - whisper_stt  - kokoro_tts  - moondream_vlm  - qwen_llm  - websocket_bridge# Development profiles — load subsets for faster iteration# Usage: oe_daemon --profile dev-llmprofiles:  full:                                 # Default — all modules    modules: "*"  dev-llm:                              # Conversation flow only (no video)    modules:      - audio_ingest      - whisper_stt      - qwen_llm      - kokoro_tts      - websocket_bridge  dev-video:                            # Video pipeline only (no LLM)    modules:      - video_ingest      - background_blur      - face_recognition      - moondream_vlm      - websocket_bridge  dev-stt-only:                         # Just audio → text (debugging Whisper)    modules:      - audio_ingest      - whisper_stt      - websocket_bridge
+# omniedge_config.yaml — Master configuration for OmniEdgeDaemon
+
+daemon:
+  watchdog_poll_ms: 1000
+  log_socket: "/tmp/omniedge_log.sock"    # Unix domain socket for centralized logging
+  zmq_pub: "tcp://127.0.0.1:5571"        # Publishes module_status + llm_prompt + image_gen_prompt + daemon_state
+  zmq_sub:                                # Subscribes to multiple publishers
+    - "tcp://127.0.0.1:5570"             # ui_command from WS Bridge
+    - "tcp://127.0.0.1:5563"             # transcription from WhisperSTT
+    - "tcp://127.0.0.1:5566"             # identity from FaceRecognition
+    - "tcp://127.0.0.1:5562"             # vlm_description from MoondreamVLM
+    - "tcp://127.0.0.1:5556"             # vad_status from AudioIngest
+  state_machine:
+    vad_silence_threshold_ms: 800         # Auto end-of-utterance after 800 ms silence
+    barge_in_enabled: true
+    llm_generation_timeout_s: 60          # Max wait for LLM before declaring timeout
+    vlm_timeout_s: 30                     # Max wait for VLM on-demand result
+  heartbeat:
+    ivl_ms: 1000                          # ZMTP PING interval
+    timeout_ms: 5000                      # Peer dead if no PONG within this
+    ttl_ms: 10000                         # Tell peer: assume I'm dead after this
+  module_ready_timeout_s: 30              # Wait for module_ready before proceeding without it
+
+modules:
+  websocket_bridge:                       # ── LAUNCHED FIRST — must be up to relay commands ──
+    binary: "./build/bin/omniedge_ws_bridge"
+    zmq_sub:                              # Subscribes to multiple publishers
+      - "tcp://127.0.0.1:5567"           # blurred_frame from BackgroundBlur
+      - "tcp://127.0.0.1:5565"           # tts_audio from KokoroTTS
+      - "tcp://127.0.0.1:5561"           # llm_response from QwenLLM
+      - "tcp://127.0.0.1:5562"           # vlm_description from MoondreamVLM
+      - "tcp://127.0.0.1:5571"           # module_status + daemon_state from Daemon
+      - "tcp://127.0.0.1:5566"           # identity + face_registered from FaceRecognition
+      - "tcp://127.0.0.1:5568"           # generated_image from FLUXImgGen
+    zmq_pub: "tcp://127.0.0.1:5570"
+    ws_port: 9001
+    max_restarts: 5
+    priority: "critical"
+
+  video_ingest:
+    binary: "./build/bin/omniedge_video_ingest"
+    args: ["--config", "omniedge_config.yaml"]
+    zmq_pub: "tcp://127.0.0.1:5555"
+    shm_name: "/oe.vid.ingest"
+    max_restarts: 5
+    priority: "critical"                  # System cannot function without video
+
+  audio_ingest:
+    binary: "./build/bin/omniedge_audio_ingest"
+    args: ["--config", "omniedge_config.yaml"]
+    zmq_pub: "tcp://127.0.0.1:5556"
+    shm_name: "/oe.aud.ingest"
+    max_restarts: 5
+    vad:
+      model_path: "./models/silero_vad.onnx"
+      threshold: 0.5
+      silence_duration_ms: 800
+
+  background_blur:
+    binary: "./build/bin/omniedge_bg_blur"
+    zmq_sub:
+      - "tcp://127.0.0.1:5555"           # video_frame from VideoIngest
+      - "tcp://127.0.0.1:5570"           # ui_command from WS Bridge (set_image_adjust, update_shapes)
+    zmq_pub: "tcp://127.0.0.1:5567"
+    shm_input: "/oe.vid.ingest"
+    shm_output: "/oe.cv.blur.jpeg"
+    engine_path: "./models/trt_engines/yolov8n-seg.engine"
+    jpeg_quality: 85                      # JPEG encode quality (0–100)
+    blur_kernel_size: 51                  # Gaussian blur kernel (must be odd)
+    blur_sigma: 25.0                      # Gaussian blur sigma
+    image_adjust:                         # ISP-style image adjustments (GPU, OpenCV CUDA)
+      brightness: 0                       # Per-pixel offset [-100, +100]
+      contrast: 1.0                       # Per-pixel scale [0.5, 3.0]
+      saturation: 1.0                     # HSV S-channel scale [0.0, 2.0]
+      sharpness: 0                        # Unsharp mask strength [0, 10]
+    cuda_stream_priority: 0               # Lowest priority
+    max_restarts: 5
+
+  face_recognition:
+    binary: "./build/bin/omniedge_face_recog"
+    zmq_sub:
+      - "tcp://127.0.0.1:5555"           # video_frame from VideoIngest
+      - "tcp://127.0.0.1:5570"           # ui_command from WS Bridge (register_face)
+    zmq_pub: "tcp://127.0.0.1:5566"
+    shm_input: "/oe.vid.ingest"
+    model_pack_path: "./models/InspireFace/Megatron_TRT"
+    recognition_threshold: 0.45
+    faces_db: "./data/known_faces.sqlite"
+    frame_subsample: 3                    # Process every 3rd frame
+    cuda_stream_priority: 0
+    max_restarts: 5
+
+  whisper_stt:
+    binary: "./build/bin/omniedge_stt"
+    zmq_sub: "tcp://127.0.0.1:5556"
+    zmq_pub: "tcp://127.0.0.1:5563"
+    shm_input: "/oe.aud.ingest"
+    encoder_engine: "./models/trt_engines/whisper-turbo/encoder"
+    decoder_engine: "./models/trt_engines/whisper-turbo/decoder"
+    cuda_stream_priority: -5              # Highest priority
+    max_restarts: 3
+    hallucination_filter:
+      no_speech_prob_threshold: 0.6       # Discard if P(no_speech) > this
+      min_avg_logprob: -1.0               # Discard if avg_logprob < this
+      max_consecutive_repeats: 3          # Suppress after N identical outputs
+
+  qwen_llm:
+    binary: "./build/bin/omniedge_llm"
+    zmq_sub: "tcp://127.0.0.1:5571"      # Subscribes ONLY to daemon (llm_prompt topic)
+    zmq_pub: "tcp://127.0.0.1:5561"
+    engine_dir: "./models/trt_engines/qwen2.5-7b-awq"
+    tokenizer_dir: "./models/qwen2.5-7b-instruct-awq"
+    max_input_len: 2048
+    max_output_len: 500
+    temperature: 0.7
+    top_p: 0.9
+    cuda_stream_priority: -5              # Highest priority
+    max_restarts: 3
+
+  kokoro_tts:
+    binary: "./build/bin/omniedge_tts"
+    zmq_sub: "tcp://127.0.0.1:5561"      # Subscribes to llm_response from QwenLLM
+    zmq_pub: "tcp://127.0.0.1:5565"
+    shm_output: "/oe.aud.tts"
+    onnx_model: "./models/onnx/kokoro-v1_0-int8.onnx"
+    voice_dir: "./models/kokoro/voices"
+    default_voice: "af_heart"
+    cuda_stream_priority: -3
+    max_restarts: 5
+
+  moondream_vlm:
+    binary: "./build/bin/omniedge_vlm"
+    zmq_sub:
+      - "tcp://127.0.0.1:5555"           # video_frame from VideoIngest
+      - "tcp://127.0.0.1:5570"           # ui_command from WS Bridge (describe_scene)
+    zmq_pub: "tcp://127.0.0.1:5562"
+    shm_input: "/oe.vid.ingest"
+    vision_engine: "./models/trt_engines/moondream2_vision.engine"
+    python_encoder: "./modules/vlm/encode_moondream_image.py"
+    cuda_stream_priority: -1
+    max_restarts: 3
+
+  flux_img_gen:
+    binary: "./build/bin/omniedge_img_gen"
+    zmq_sub: "tcp://127.0.0.1:5571"      # Subscribes to daemon (image_gen_prompt topic)
+    zmq_pub: "tcp://127.0.0.1:5568"
+    shm_output: "/oe.cv.imggen.jpeg"
+    engine_dir: "./models/trt_engines/flux-schnell-int8"
+    cuda_stream_priority: 0               # Background priority — on-demand only
+    max_restarts: 3
+    on_demand: true                       # Not launched at boot; posix_spawn'd when needed
+
+# Launch order (daemon respects this sequence):
+# WS Bridge is launched FIRST so it is ready to relay module_ready events
+# and UI commands from the moment other modules start publishing.
+launch_order:
+  - websocket_bridge
+  - video_ingest
+  - audio_ingest
+  - background_blur
+  - face_recognition
+  - whisper_stt
+  - kokoro_tts
+  - qwen_llm
+  # moondream_vlm: launched on-demand or at boot depending on tier
+  # flux_img_gen: always on-demand (never in launch_order)
+
+# Development profiles — load subsets for faster iteration
+# Usage: oe_daemon --profile dev-llm
+profiles:
+  full:                                   # Default — all core modules
+    modules: "*"
+  dev-llm:                                # Conversation flow only (no video)
+    modules:
+      - websocket_bridge
+      - audio_ingest
+      - whisper_stt
+      - qwen_llm
+      - kokoro_tts
+  dev-video:                              # Video pipeline only (no LLM)
+    modules:
+      - websocket_bridge
+      - video_ingest
+      - background_blur
+      - face_recognition
+      - moondream_vlm
+  dev-stt-only:                           # Just audio → text (debugging Whisper)
+    modules:
+      - websocket_bridge
+      - audio_ingest
+      - whisper_stt
 ```
 
 The daemon parses this YAML (via [yaml-cpp](https://github.com/jbeder/yaml-cpp)) at startup, constructs `ModuleDescriptor` structs from each entry, and passes module-specific config as command-line arguments or environment variables to each `posix_spawn()` call. When `--profile` is specified, only the named modules are launched; the rest are skipped. The WebSocketBridge adapts its UI automatically based on which modules report `module_ready` (see **Module Startup Readiness Protocol** below).
 
 ### **Configuration Layers — No Hardcoded Numbers**
 
-OmniEdge_AI enforces a strict "no magic numbers" policy. Every tunable value lives in exactly one of three layers. Module `.cpp` files never contain bare numeric literals for tuning.
+OmniEdge_AI enforces a strict "no magic numbers" policy. Every tunable value lives in exactly one of four layers. Module `.cpp` files never contain bare numeric literals for tuning.
 
 **Layer 1: Runtime Config (`omniedge_config.yaml`)**Deployment-specific values that change without recompilation: ports, engine paths, thresholds, timeouts, JPEG quality, VAD sensitivity, LLM temperature, recognition thresholds, `max_restarts`, CUDA stream priorities. These are read by each module's `Config` struct via `yaml-cpp`.
 
 **Layer 2: Compile-time Tuning (`config/oe_tuning.hpp`)**Hardware-class tuning constants that affect code generation and require a rebuild when changed:
 
 ```cpp
-// config/oe_tuning.hpp — Compile-time tuning constants#pragma oncenamespace omniedge::tuning {// Shared memoryinline constexpr int kShmDoubleBufferSlots = 2;      // Double-buffer ring slotsinline constexpr int kShmMaxSegmentBytes   = 16 * 1024 * 1024;  // 16 MB max segment// ZMQinline constexpr int kZmqSndHwm            = 2;       // PUB high-water markinline constexpr int kZmqRcvHwm            = 2;       // SUB high-water markinline constexpr int kZmqLingerMs           = 0;       // Linger on close// Video pipelineinline constexpr int kMaxFrameWidth         = 1920;inline constexpr int kMaxFrameHeight        = 1080;inline constexpr int kFrameChannels         = 3;       // BGR24// Audio pipelineinline constexpr int kAudioSampleRate       = 16000;   // Hz (Whisper input)inline constexpr int kAudioChunkMs          = 30;      // ms per PCM chunk// CUDAinline constexpr int kCudaMaxStreamsPerProc  = 4;}  // namespace omniedge::tuning
+// config/oe_tuning.hpp — Compile-time tuning constants
+#pragma once
+
+namespace omniedge::tuning {
+
+// Shared memory
+inline constexpr int kShmDoubleBufferSlots = 2;      // Double-buffer ring slots
+inline constexpr int kShmMaxSegmentBytes   = 16 * 1024 * 1024;  // 16 MB max segment
+
+// ZMQ
+inline constexpr int kZmqSndHwm            = 2;       // PUB high-water mark
+inline constexpr int kZmqRcvHwm            = 2;       // SUB high-water mark
+inline constexpr int kZmqLingerMs           = 0;       // Linger on close
+
+// Video pipeline
+inline constexpr int kMaxFrameWidth         = 1920;
+inline constexpr int kMaxFrameHeight        = 1080;
+inline constexpr int kFrameChannels         = 3;       // BGR24
+
+// Audio pipeline
+inline constexpr int kAudioSampleRate       = 16000;   // Hz (Whisper input)
+inline constexpr int kAudioChunkMs          = 30;      // ms per PCM chunk
+
+// CUDA
+inline constexpr int kCudaMaxStreamsPerProc  = 4;
+
+}  // namespace omniedge::tuning
 ```
 
 **Layer 3: Platform Detection (`config/oe_platform.hpp`)**Compile-time guards for OS/driver differences:
 
 ```cpp
-// config/oe_platform.hpp — Platform-specific gates#pragma once// WSL2 detection: cudaHostRegister is unsupported under WDDM; use cudaHostAlloc#if defined(__linux__)  #include <fstream>  #define OE_PLATFORM_WSL2 ([]{       std::ifstream f("/proc/version"); std::string s; std::getline(f,s);       return s.find("microsoft") != std::string::npos || s.find("WSL") != std::string::npos;   }())#else  #define OE_PLATFORM_WSL2 false#endif// CUDA SM version gates (set by CMake via target_compile_definitions)// OE_SM_MAJOR is defined as __CUDA_ARCH__ / 100 at build time#ifndef OE_SM_MAJOR  #define OE_SM_MAJOR 0#endif// Blackwell-specific features (SM ≥ 100)#define OE_HAS_BLACKWELL_FEATURES (OE_SM_MAJOR >= 10)
+// config/oe_platform.hpp — Platform-specific gates
+#pragma once
+
+// WSL2 detection: cudaHostRegister is unsupported under WDDM; use cudaHostAlloc
+#if defined(__linux__)
+  #include <fstream>
+  #define OE_PLATFORM_WSL2 ([]{ \
+      std::ifstream f("/proc/version"); std::string s; std::getline(f,s); \
+      return s.find("microsoft") != std::string::npos || s.find("WSL") != std::string::npos; \
+  }())
+#else
+  #define OE_PLATFORM_WSL2 false
+#endif
+
+// CUDA SM version gates (set by CMake via target_compile_definitions)
+// OE_SM_MAJOR is defined as __CUDA_ARCH__ / 100 at build time
+#ifndef OE_SM_MAJOR
+  #define OE_SM_MAJOR 0
+#endif
+
+// Blackwell-specific features (SM >= 100)
+#define OE_HAS_BLACKWELL_FEATURES (OE_SM_MAJOR >= 10)
 ```
 
 **Layer 4: Runtime Defaults (`common/oe_defaults.hpp`)**Fallback values used when a YAML field is missing. Every configurable parameter has a default:
 
 ```cpp
-// common/oe_defaults.hpp — Default values for YAML-configurable parameters#pragma oncenamespace omniedge::defaults {// Watchdoginline constexpr int kWatchdogPollMs        = 1000;inline constexpr int kMaxRestarts           = 5;inline constexpr int kModuleReadyTimeoutS   = 30;// VADinline constexpr float kVadThreshold        = 0.5f;inline constexpr int kVadSilenceDurationMs  = 800;// State Machine Timeoutsinline constexpr int kLlmGenerationTimeoutS = 60;inline constexpr int kVlmTimeoutS           = 30;// Face Recognitioninline constexpr float kRecognitionThreshold = 0.45f;inline constexpr int kFrameSubsample        = 3;// Background Blurinline constexpr int kJpegQuality           = 85;inline constexpr int kBlurKernelSize        = 51;inline constexpr float kBlurSigma           = 25.0f;// LLMinline constexpr int kMaxInputLen           = 2048;inline constexpr int kMaxOutputLen          = 500;inline constexpr float kTemperature         = 0.7f;inline constexpr float kTopP                = 0.9f;// ZMQ Heartbeatsinline constexpr int kHeartbeatIvlMs        = 1000;inline constexpr int kHeartbeatTimeoutMs    = 5000;inline constexpr int kHeartbeatTtlMs        = 10000;// TTSinline constexpr int kTtsSampleRate         = 24000;// GPU Tier VRAM Thresholds (MB)inline constexpr size_t kVramThresholdUltraMb    = 15500;inline constexpr size_t kVramThresholdStandardMb = 11000;inline constexpr size_t kVramThresholdBalancedMb = 7000;inline constexpr size_t kVramHeadroomMb          = 500;// Whisper Hallucination Filtersinline constexpr float kNoSpeechProbThreshold    = 0.6f;inline constexpr float kMinAvgLogprob            = -1.0f;inline constexpr int kMaxConsecutiveRepeats       = 3;}  // namespace omniedge::defaults
+// common/oe_defaults.hpp — Default values for YAML-configurable parameters
+#pragma once
+
+namespace omniedge::defaults {
+
+// Watchdog
+inline constexpr int kWatchdogPollMs        = 1000;
+inline constexpr int kMaxRestarts           = 5;
+inline constexpr int kModuleReadyTimeoutS   = 30;
+
+// VAD
+inline constexpr float kVadThreshold        = 0.5f;
+inline constexpr int kVadSilenceDurationMs  = 800;
+
+// State Machine Timeouts
+inline constexpr int kLlmGenerationTimeoutS = 60;
+inline constexpr int kVlmTimeoutS           = 30;
+
+// Face Recognition
+inline constexpr float kRecognitionThreshold = 0.45f;
+inline constexpr int kFrameSubsample        = 3;
+
+// Background Blur
+inline constexpr int kJpegQuality           = 85;
+inline constexpr int kBlurKernelSize        = 51;
+inline constexpr float kBlurSigma           = 25.0f;
+
+// LLM
+inline constexpr int kMaxInputLen           = 2048;
+inline constexpr int kMaxOutputLen          = 500;
+inline constexpr float kTemperature         = 0.7f;
+inline constexpr float kTopP                = 0.9f;
+
+// ZMQ Heartbeats
+inline constexpr int kHeartbeatIvlMs        = 1000;
+inline constexpr int kHeartbeatTimeoutMs    = 5000;
+inline constexpr int kHeartbeatTtlMs        = 10000;
+
+// TTS
+inline constexpr int kTtsSampleRate         = 24000;
+
+// GPU Tier VRAM Thresholds (MB)
+inline constexpr size_t kVramThresholdUltraMb    = 15500;
+inline constexpr size_t kVramThresholdStandardMb = 11000;
+inline constexpr size_t kVramThresholdBalancedMb = 7000;
+inline constexpr size_t kVramHeadroomMb          = 500;
+
+// Whisper Hallucination Filters
+inline constexpr float kNoSpeechProbThreshold    = 0.6f;
+inline constexpr float kMinAvgLogprob            = -1.0f;
+inline constexpr int kMaxConsecutiveRepeats       = 3;
+
+}  // namespace omniedge::defaults
 ```
 
 **Usage in module code:**
 
 ```cpp
-// In WhisperSTTNode::Config population from YAML:cfg_.vadThreshold = node["vad"]["threshold"].as<float>(omniedge::defaults::kVadThreshold);cfg_.silenceDurationMs = node["vad"]["silence_duration_ms"].as<int>(omniedge::defaults::kVadSilenceDurationMs);// No bare "0.5f" or "800" anywhere in the codebase.
+// In WhisperSTTNode::Config population from YAML:
+cfg_.vadThreshold = node["vad"]["threshold"].as<float>(omniedge::defaults::kVadThreshold);
+cfg_.silenceDurationMs = node["vad"]["silence_duration_ms"].as<int>(omniedge::defaults::kVadSilenceDurationMs);
+// No bare "0.5f" or "800" anywhere in the codebase.
 ```
 
 ### **Module Startup Readiness Protocol**
@@ -2052,7 +2470,20 @@ The daemon spawns 9 processes sequentially via `posix_spawn()`. A ZMQ SUB socket
 5.  **Timeout:** If a module does not report ready within 30 seconds, the daemon logs a warning and proceeds without it (graceful degradation).
 
 ```cpp
-// In OmniEdgeDaemon::waitForReadiness()std::unordered_set<std::string> pending(expectedModules.begin(), expectedModules.end());auto deadline = steady_clock::now() + 30s;while (!pending.empty() && steady_clock::now() < deadline) {    auto msg = zmqSub_.receive(/*timeoutMs=*/1000);    if (msg && msg->at("type") == "module_ready") {        pending.erase(msg->at("module").get<std::string>());        logInfo("Module ready: {}", msg->at("module"));    }}if (!pending.empty()) {    for (const auto& m : pending)        logWarn("Module {} did not report ready within 30s", m);}
+// In OmniEdgeDaemon::waitForReadiness()
+std::unordered_set<std::string> pending(expectedModules.begin(), expectedModules.end());
+auto deadline = steady_clock::now() + 30s;
+while (!pending.empty() && steady_clock::now() < deadline) {
+    auto msg = zmqSub_.receive(/*timeoutMs=*/1000);
+    if (msg && msg->at("type") == "module_ready") {
+        pending.erase(msg->at("module").get<std::string>());
+        logInfo("Module ready: {}", msg->at("module"));
+    }
+}
+if (!pending.empty()) {
+    for (const auto& m : pending)
+        logWarn("Module {} did not report ready within 30s", m);
+}
 ```
 
 ---
@@ -2120,7 +2551,33 @@ huggingface-cli download vikhyatk/moondream2 --revision 2025-01-09 --local-dir /
 **Step 2: Export to ONNX**
 
 ```python
-# export_moondream_onnx.pyimport torchfrom transformers import AutoModelForCausalLM, AutoTokenizermodel = AutoModelForCausalLM.from_pretrained(    "/models/moondream2",    revision="2025-01-09",    trust_remote_code=True,    torch_dtype=torch.float16)# Export the vision encoder separately from the text decoder# Vision Encodervision_encoder = model.vision_encoderdummy_image = torch.randn(1, 3, 378, 378, dtype=torch.float16)torch.onnx.export(    vision_encoder, dummy_image,    "/models/moondream2/vision_encoder.onnx",    input_names=["pixel_values"],    output_names=["image_features"],    dynamic_axes={"pixel_values": {0: "batch"}},    opset_version=17)# Text Decoder: Moondream2's decoder uses custom cross-attention that fails standard# ONNX export. The recommended approach is the HYBRID PATH described below.
+# export_moondream_onnx.py
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained(
+    "/models/moondream2",
+    revision="2025-01-09",
+    trust_remote_code=True,
+    torch_dtype=torch.float16
+)
+
+# Export the vision encoder separately from the text decoder
+# Vision Encoder
+vision_encoder = model.vision_encoder
+dummy_image = torch.randn(1, 3, 378, 378, dtype=torch.float16)
+
+torch.onnx.export(
+    vision_encoder, dummy_image,
+    "/models/moondream2/vision_encoder.onnx",
+    input_names=["pixel_values"],
+    output_names=["image_features"],
+    dynamic_axes={"pixel_values": {0: "batch"}},
+    opset_version=17
+)
+
+# Text Decoder: Moondream2's decoder uses custom cross-attention that fails standard
+# ONNX export. The recommended approach is the HYBRID PATH described below.
 ```
 
 **Recommended Hybrid Path (Vision in Python, Decoder in C++):**
@@ -2137,13 +2594,54 @@ Moondream2's text decoder uses custom cross-attention between vision tokens and 
     
 
 ```python
-# encode_moondream_image.py — called by MoondreamVLMNode via posix_spawnimport torchimport numpy as npfrom transformers import AutoModelForCausalLMmodel = AutoModelForCausalLM.from_pretrained(    "/models/moondream2", revision="2025-01-09",    trust_remote_code=True, torch_dtype=torch.float16)def encode_and_write_shm(image_path, shm_path="/oe.vlm.features"):    """Encode image → write features to shared memory for C++ decoder."""    from PIL import Image    img = Image.open(image_path)    # model.encode_image returns projected features ready for the decoder    features = model.encode_image(img)  # shape: [1, num_patches, hidden_dim]    features_np = features.detach().cpu().numpy()    # Write to shared memory (C++ consumer reads this)    # ... POSIX shm write using mmap ...
+```python
+# encode_moondream_image.py — called by MoondreamVLMNode via posix_spawn (lives in modules/vlm/)
+import torch
+import numpy as np
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "/models/moondream2", revision="2025-01-09",
+    trust_remote_code=True, torch_dtype=torch.float16
+)
+
+def encode_and_write_shm(image_path, shm_path="/oe.vlm.features"):
+    """Encode image → write features to shared memory for C++ decoder."""
+    from PIL import Image
+    img = Image.open(image_path)
+    
+    # model.encode_image returns projected features ready for the decoder
+    features = model.encode_image(img)  # shape: [1, num_patches, hidden_dim]
+    features_np = features.detach().cpu().numpy()
+    
+    # Write to shared memory (C++ consumer reads this)
+    # ... POSIX shm write using mmap ...
+```
 ```
 
 This hybrid approach avoids the ONNX export minefield entirely while still keeping the latency-critical text generation in C++. The Python vision encoding runs in ~50ms (one-shot per image) and only executes on-demand when the user requests "describe what you see."
 
 ```
-**Step 3: Build TensorRT Engines via trtexec**```bash# Vision encodertrtexec   --onnx=/models/moondream2/vision_encoder.onnx   --saveEngine=/models/trt_engines/moondream2_vision.engine   --fp16   --minShapes=pixel_values:1x3x378x378   --optShapes=pixel_values:1x3x378x378   --maxShapes=pixel_values:1x3x378x378# Text decoder (after ONNX export with INT4 weight quantization)trtexec   --onnx=/models/moondream2/text_decoder.onnx   --saveEngine=/models/trt_engines/moondream2_decoder.engine   --int8 --fp16   --minShapes=input_ids:1x1   --optShapes=input_ids:1x256   --maxShapes=input_ids:1x512
+**Step 3: Build TensorRT Engines via trtexec**
+```bash
+# Vision encoder
+trtexec \
+  --onnx=/models/moondream2/vision_encoder.onnx \
+  --saveEngine=/models/trt_engines/moondream2_vision.engine \
+  --fp16 \
+  --minShapes=pixel_values:1x3x378x378 \
+  --optShapes=pixel_values:1x3x378x378 \
+  --maxShapes=pixel_values:1x3x378x378
+
+# Text decoder (after ONNX export with INT4 weight quantization)
+trtexec \
+  --onnx=/models/moondream2/text_decoder.onnx \
+  --saveEngine=/models/trt_engines/moondream2_decoder.engine \
+  --int8 --fp16 \
+  --minShapes=input_ids:1x1 \
+  --optShapes=input_ids:1x256 \
+  --maxShapes=input_ids:1x512
+```
 ```
 
 **Note:** The hybrid approach above (Python vision encoder + C++ text decoder) is the recommended path. Direct full-model ONNX export with custom operator registration is possible but fragile — `trust_remote_code` modules may break silently across HuggingFace revisions. The `trtexec` commands below still apply for converting the separately exported vision encoder ONNX to a TensorRT engine. The text decoder runs via ONNX Runtime in C++ with the pre-computed vision features as input, sidestepping the cross-attention export problem entirely.
@@ -2380,11 +2878,40 @@ The data flow for **every** consumer is:
 This means 3 consumers (BackgroundBlur, FaceRecognition, VLM) each perform independent `memcpy` from the same shm region. The 3× CPU memcpy is the cost of fault isolation — each process can crash without affecting others' pinned allocations. In practice, `memcpy` of a 6.2 MB BGR frame from L3 cache takes ~0.3 ms, so 3× is ~0.9 ms total — well within budget.
 
 ```mermaid
-classDiagram    class PinnedStagingBuffer {        -void* pinnedPtr_ : cudaHostAlloc'd page-locked host memory (PROCESS-LOCAL)        -size_t size_ : Buffer capacity in bytes        -atomic~uint64_t~ stagedSequence_ : Sequence number of the currently staged frame        +PinnedStagingBuffer(size)        +stageFromShm(shmPayload: void*, bytes: size_t, seq: uint64_t) : void        +transferToDevice(dst: void*, bytes: size_t, stream: cudaStream_t) : void        +stagedSequence() : uint64_t        +hostPtr() : const void*    }    note for PinnedStagingBuffer "WSL2-compatible: uses cudaHostAllocn(cudaHostRegister is unsupported on WSL2).nOne instance PER PROCESS PER shm segment.nEach consumer owns its own pinned buffer.nCross-process sharing is architecturallynimpossible with cudaHostAlloc.nstagedSequence_ prevents re-staging thensame frame within a single process."
+classDiagram
+    class PinnedStagingBuffer {
+        -void* pinnedPtr_ : cudaHostAlloc'd page-locked host memory (PROCESS-LOCAL)
+        -size_t size_ : Buffer capacity in bytes
+        -atomic~uint64_t~ stagedSequence_ : Sequence number of the currently staged frame
+        +PinnedStagingBuffer(size)
+        +stageFromShm(shmPayload: void*, bytes: size_t, seq: uint64_t) : void
+        +transferToDevice(dst: void*, bytes: size_t, stream: cudaStream_t) : void
+        +stagedSequence() : uint64_t
+        +hostPtr() : const void*
+    }
+    note for PinnedStagingBuffer "WSL2-compatible: uses cudaHostAlloc\n(cudaHostRegister is unsupported on WSL2).\nOne instance PER PROCESS PER shm segment.\nEach consumer owns its own pinned buffer.\nCross-process sharing is architecturally\nimpossible with cudaHostAlloc.\nstagedSequence_ prevents re-staging the\nsame frame within a single process."
 ```
 
 ```mermaid
-classDiagram    class ZmqPublisher {        -zmq::context_t ctx_        -zmq::socket_t socket_        +ZmqPublisher(endpoint: string) : Binds PUB socket        +publish(topic: string, metadata: json) : void    }    class ZmqSubscriber {        -zmq::context_t ctx_        -zmq::socket_t socket_        +ZmqSubscriber(endpoint, topicFilter, enableConflate)        +receive(timeoutMs: int) : optional~json~    }    class ZmqWatchdog {        +configureHeartbeat(socket, intervalMs, timeoutMs)$ : void        +monitor(sockets: vector, on_dead: callback) : void    }    note for ZmqSubscriber "ZMQ_CONFLATE is opt-in per subscriber:nenableConflate=true for data-plane topicsn(video_frame, audio_chunk, identity).nenableConflate=false for control-planentopics (ui_command, llm_prompt, etc.).ntopicFilter subscribes to matching prefixes."    note for ZmqWatchdog "Uses ZMTP PING/PONG protocol.nDeclares peer dead after heartbeatTimeoutMs."
+classDiagram
+    class ZmqPublisher {
+        -zmq::context_t ctx_
+        -zmq::socket_t socket_
+        +ZmqPublisher(endpoint: string) : Binds PUB socket
+        +publish(topic: string, metadata: json) : void
+    }
+    class ZmqSubscriber {
+        -zmq::context_t ctx_
+        -zmq::socket_t socket_
+        +ZmqSubscriber(endpoint, topicFilter, enableConflate)
+        +receive(timeoutMs: int) : optional~json~
+    }
+    class ZmqWatchdog {
+        +configureHeartbeat(socket, intervalMs, timeoutMs)$ : void
+        +monitor(sockets: vector, on_dead: callback) : void
+    }
+    note for ZmqSubscriber "ZMQ_CONFLATE is opt-in per subscriber:\nenableConflate=true for data-plane topics\n(video_frame, audio_chunk, identity).\nenableConflate=false for control-plane\ntopics (ui_command, llm_prompt, etc.).\ntopicFilter subscribes to matching prefixes."
+    note for ZmqWatchdog "Uses ZMTP PING/PONG protocol.\nDeclares peer dead after heartbeatTimeoutMs."
 ```
 
 ### **Model Abstraction Layer (Backend Swappability)**
@@ -2392,13 +2919,91 @@ classDiagram    class ZmqPublisher {        -zmq::context_t ctx_        -zmq::so
 Every inference module implements a **role-specific C++ interface**. Concrete implementations are selected at runtime via the `backend` field in YAML config. To swap Qwen for Llama 3, write a new class implementing the same interface — no other code changes needed.
 
 ```mermaid
-classDiagram    class ILLMBackend {        <<interface>>        +initialize(config: json) : void        +generate(prompt: string, max_tokens: int, callback: function) : void        +tokenize(text: string) : vector~int32_t~        +detokenize(token_ids: vector~int32_t~) : string        +cancel() : void        +name() : string    }    class ISTTBackend {        <<interface>>        +initialize(config: json) : void        +transcribe(pcmF32: float*, numSamples: size_t) : TranscriptionResult        +name() : string    }    class ITTSBackend {        <<interface>>        +initialize(config: json) : void        +synthesize(text: string, voice: string) : vector~float~        +name() : string    }    class IVLMBackend {        <<interface>>        +initialize(config: json) : void        +describeFrame(bgr: uint8_t*, w: int, h: int) : string        +name() : string    }    class ICVDetector {        <<interface>>        +initialize(config: json) : void        +detect(bgr: uint8_t*, w: int, h: int) : vector~Detection~        +name() : string    }    class ICVSegmenter {        <<interface>>        +initialize(config: json) : void        +segment(bgr: uint8_t*, w: int, h: int) : Mask        +name() : string    }    class TrtLlmQwenBackend {        +initialize(config) : void        +generate(prompt, max_tokens, callback) : void        +tokenize(text) : vector~int32_t~        +detokenize(ids) : string        +cancel() : void        +name() : string = "trt-llm-qwen"    }    class LlamaCppBackend {        +initialize(config) : void        +generate(prompt, max_tokens, callback) : void        +tokenize(text) : vector~int32_t~        +detokenize(ids) : string        +cancel() : void        +name() : string = "llama-cpp"    }    class TrtLlmWhisperBackend {        +initialize(config) : void        +transcribe(pcm_f32, num_samples) : TranscriptionResult        +name() : string = "trt-llm-whisper"    }    class OnnxKokoroBackend {        +initialize(config) : void        +synthesize(text, voice) : vector~float~        +name() : string = "onnx-kokoro"    }    ILLMBackend <|.. TrtLlmQwenBackend    ILLMBackend <|.. LlamaCppBackend    ISTTBackend <|.. TrtLlmWhisperBackend    ITTSBackend <|.. OnnxKokoroBackend    note for ILLMBackend "generate() takes a streaming callback:ncallback(token: string, finished: bool)nThis lets the caller (QwenLLMNode) streamntokens over ZMQ without blocking."
+classDiagram
+    class ILLMBackend {
+        <<interface>>
+        +initialize(config: json) : void
+        +generate(prompt: string, max_tokens: int, callback: function) : void
+        +tokenize(text: string) : vector~int32_t~
+        +detokenize(token_ids: vector~int32_t~) : string
+        +cancel() : void
+        +name() : string
+    }
+    class ISTTBackend {
+        <<interface>>
+        +initialize(config: json) : void
+        +transcribe(pcmF32: float*, numSamples: size_t) : TranscriptionResult
+        +name() : string
+    }
+    class ITTSBackend {
+        <<interface>>
+        +initialize(config: json) : void
+        +synthesize(text: string, voice: string) : vector~float~
+        +name() : string
+    }
+    class IVLMBackend {
+        <<interface>>
+        +initialize(config: json) : void
+        +describeFrame(bgr: uint8_t*, w: int, h: int) : string
+        +name() : string
+    }
+    class ICVDetector {
+        <<interface>>
+        +initialize(config: json) : void
+        +detect(bgr: uint8_t*, w: int, h: int) : vector~Detection~
+        +name() : string
+    }
+    class ICVSegmenter {
+        <<interface>>
+        +initialize(config: json) : void
+        +segment(bgr: uint8_t*, w: int, h: int) : Mask
+        +name() : string
+    }
+    class TrtLlmQwenBackend {
+        +initialize(config) : void
+        +generate(prompt, max_tokens, callback) : void
+        +tokenize(text) : vector~int32_t~
+        +detokenize(ids) : string
+        +cancel() : void
+        +name() : string = "trt-llm-qwen"
+    }
+    class LlamaCppBackend {
+        +initialize(config) : void
+        +generate(prompt, max_tokens, callback) : void
+        +tokenize(text) : vector~int32_t~
+        +detokenize(ids) : string
+        +cancel() : void
+        +name() : string = "llama-cpp"
+    }
+    class TrtLlmWhisperBackend {
+        +initialize(config) : void
+        +transcribe(pcm_f32, num_samples) : TranscriptionResult
+        +name() : string = "trt-llm-whisper"
+    }
+    class OnnxKokoroBackend {
+        +initialize(config) : void
+        +synthesize(text, voice) : vector~float~
+        +name() : string = "onnx-kokoro"
+    }
+    ILLMBackend <|.. TrtLlmQwenBackend
+    ILLMBackend <|.. LlamaCppBackend
+    ISTTBackend <|.. TrtLlmWhisperBackend
+    ITTSBackend <|.. OnnxKokoroBackend
+    note for ILLMBackend "generate() takes a streaming callback:\ncallback(token: string, finished: bool)\nThis lets the caller (QwenLLMNode) stream\ntokens over ZMQ without blocking."
 ```
 
 **YAML config `backend` field:** Each module specifies which backend implementation to load:
 
 ```yaml
-  qwen_llm:    backend: "trt-llm"       # Options: "trt-llm", "llama-cpp", "onnx-runtime"    # ... rest of config  whisper_stt:    backend: "trt-llm"       # Options: "trt-llm", "faster-whisper"  kokoro_tts:    backend: "onnx-runtime"  # Options: "onnx-runtime", "trt"  moondream_vlm:    backend: "trt-hybrid"    # Options: "trt-hybrid", "onnx-runtime"
+  qwen_llm:
+    backend: "trt-llm"       # Options: "trt-llm", "llama-cpp", "onnx-runtime"
+    # ... rest of config
+  whisper_stt:
+    backend: "trt-llm"       # Options: "trt-llm", "faster-whisper"
+  kokoro_tts:
+    backend: "onnx-runtime"  # Options: "onnx-runtime", "trt"
+  moondream_vlm:
+    backend: "trt-hybrid"    # Options: "trt-hybrid", "onnx-runtime"
 ```
 
 **How to add a Llama 3 backend (example):**
@@ -2418,7 +3023,7 @@ int main(int argc, char** argv) {    auto config = loadYaml(argv[1]);    std::st
 ### **GStreamer Video Ingestion Module**
 
 ```mermaid
-classDiagram    class VideoIngestNode {        +Config config_        -GstElement* pipeline_ : GStreamer pipeline handle        -GstElement* appsink_ : appsink element (drop=1, max-buffers=2)        -SharedMemoryProducer shmProducer_ : Writes BGR frames to POSIX shm        -ZmqPublisher zmqPub_ : Publishes frame metadata        -uint64_t frameCounter_ : Incremented per captured frame        -bool running_        +initialize() : void        +run() : void (blocking — starts GStreamer main loop)        +stop() : void (sends EOS, cleans up)        -onNewSample(sink, user_data)$ : GstFlowReturn    }    class VideoIngestNode_Config {        <<Config>>        +string hostIp : Windows host IP for tcpclientsrc        +int port = 5000 : TCP port from host GStreamer producer        +int width = 1920        +int height = 1080        +string shmName = "/oe.vid.ingest"        +string zmqPubEndpoint = "tcp://127.0.0.1:5555"    }    class AudioIngestNode {        +Config config_        -GstElement* pipeline_ : GStreamer audio pipeline        -SharedMemoryProducer shmProducer_ : Writes PCM F32 to POSIX shm        -ZmqPublisher zmqPub_ : Publishes audio chunk metadata        -uint64_t chunkCounter_        +initialize() : void        +run() : void        +stop() : void        -onNewSample(sink, user_data)$ : GstFlowReturn    }    class AudioIngestNode_Config {        <<Config>>        +string hostIp        +int port = 5001 : Separate TCP port for audio        +int sampleRate = 16000 : Whisper expects 16kHz        +int channels = 1 : Mono        +string shmName = "/oe.aud.ingest"        +string zmqPubEndpoint = "tcp://127.0.0.1:5556"    }    VideoIngestNode --> VideoIngestNode_Config    AudioIngestNode --> AudioIngestNode_Config    VideoIngestNode --> SharedMemoryProducer : writes frames    VideoIngestNode --> ZmqPublisher : publishes metadata    AudioIngestNode --> SharedMemoryProducer : writes audio    AudioIngestNode --> ZmqPublisher : publishes metadata    note for VideoIngestNode "Pipeline: tcpclientsrc → h264parse → avdec_h264n→ videoconvert → BGR appsinknCallback copies BGR to POSIX shm,npublishes ZMQ: {type:video_frame, shm_id:...}"    note for AudioIngestNode "Pipeline: tcpclientsrc → F32LE 16kHz mono appsinknCallback copies PCM chunk to POSIX shm"
+classDiagram    class VideoIngestNode {        +Config config_        -GstElement* pipeline_ : GStreamer pipeline handle        -GstElement* appsink_ : appsink element (drop=1, max-buffers=2)        -SharedMemoryProducer shmProducer_ : Writes BGR frames to POSIX shm        -ZmqPublisher zmqPub_ : Publishes frame metadata        -uint64_t frameCounter_ : Incremented per captured frame        -bool running_        +initialize() : void        +run() : void (blocking — starts GStreamer main loop)        +stop() : void (sends EOS, cleans up)        -onNewSample(sink, user_data)$ : GstFlowReturn    }    class VideoIngestNode_Config {        <<Config>>        +string v4l2Device : V4L2 device path (primary, e.g. /dev/video0)        +string hostIp : Windows host IP for tcpclientsrc (TCP fallback)        +int port = 5000 : TCP port from host GStreamer producer (TCP fallback)        +int width = 1920        +int height = 1080        +string shmName = "/oe.vid.ingest"        +string zmqPubEndpoint = "tcp://127.0.0.1:5555"    }    class AudioIngestNode {        +Config config_        -GstElement* pipeline_ : GStreamer audio pipeline        -SharedMemoryProducer shmProducer_ : Writes PCM F32 to POSIX shm        -ZmqPublisher zmqPub_ : Publishes audio chunk metadata        -uint64_t chunkCounter_        +initialize() : void        +run() : void        +stop() : void        -onNewSample(sink, user_data)$ : GstFlowReturn    }    class AudioIngestNode_Config {        <<Config>>        +string hostIp        +int port = 5001 : Separate TCP port for audio        +int sampleRate = 16000 : Whisper expects 16kHz        +int channels = 1 : Mono        +string shmName = "/oe.aud.ingest"        +string zmqPubEndpoint = "tcp://127.0.0.1:5556"    }    VideoIngestNode --> VideoIngestNode_Config    AudioIngestNode --> AudioIngestNode_Config    VideoIngestNode --> SharedMemoryProducer : writes frames    VideoIngestNode --> ZmqPublisher : publishes metadata    AudioIngestNode --> SharedMemoryProducer : writes audio    AudioIngestNode --> ZmqPublisher : publishes metadata    note for VideoIngestNode "V4L2 via usbipd: v4l2src → videoconvert → BGR appsinknCallback copies BGR to POSIX shm,npublishes ZMQ: {type:video_frame, shm_id:...}"    note for AudioIngestNode "Pipeline: tcpclientsrc → F32LE 16kHz mono appsinknCallback copies PCM chunk to POSIX shm"
 ```
 
 ### **LLM Module: Qwen 2.5 7B (TensorRT-LLM C++ Runtime)**
@@ -2465,17 +3070,122 @@ Background Blur serves **two purposes:**
 2.  **Visual polish:** The blurred composite JPEG is the primary video stream sent to the browser at 30 FPS — it is the visible video output of OmniEdge_AI's UI.
 
 ```mermaid
-classDiagram    class FaceRecognitionNode {        +Config config_        -HFSession session_ : InspireFace SDK session handle        -PinnedStagingBuffer stagingBuffer_        -SharedMemoryConsumer shmConsumer_ : Reads BGR frames from POSIX shm        -ZmqSubscriber zmqSubFrames_ : SUB video_frame from VideoIngest (5555)        -ZmqSubscriber zmqSubCmds_ : SUB ui_command from WS Bridge (5570)        -ZmqPublisher zmqPub_ : PUB identity + face_registered (5566)        -sqlite3* facesDb_ : SQLite database for known face embeddings        -unordered_map~string, vector~float~~ knownFaces_ : Name → embedding cache (loaded from DB at init)        -bool running_        +initialize() : void        +run() : void        +registerFace(name, bgrData, width, height) : bool        +stop() : void        -identify(embedding, dim) : pair~string, float~        -loadFacesFromDb() : void    }    class FaceRecognitionNode_Config {        <<Config>>        +string modelPackPath : InspireFace Megatron_TRT model pack        +float recognitionThreshold = 0.45 : Cosine similarity threshold        +string knownFacesDb : SQLite face embedding database path        +string zmqSubEndpoint = "tcp://127.0.0.1:5555"        +string zmqCmdEndpoint = "tcp://127.0.0.1:5570"        +string zmqPubEndpoint = "tcp://127.0.0.1:5566"    }    FaceRecognitionNode --> FaceRecognitionNode_Config    FaceRecognitionNode --> PinnedStagingBuffer    FaceRecognitionNode --> SharedMemoryConsumer    FaceRecognitionNode --> ZmqSubscriber    FaceRecognitionNode --> ZmqPublisher    note for FaceRecognitionNode "**Two paths:**n1. Every 3rd frame: detect → align → embed → match → PUB identityn2. On register_face cmd: detect → align → embed → INSERT into SQLitenOutput identity: {name, confidence, bbox, landmarks}nOutput face_registered: {name, success, error_msg}"
+classDiagram
+    class FaceRecognitionNode {
+        +Config config_
+        -HFSession session_ : InspireFace SDK session handle
+        -PinnedStagingBuffer stagingBuffer_
+        -SharedMemoryConsumer shmConsumer_ : Reads BGR frames from POSIX shm
+        -ZmqSubscriber zmqSubFrames_ : SUB video_frame from VideoIngest (5555)
+        -ZmqSubscriber zmqSubCmds_ : SUB ui_command from WS Bridge (5570)
+        -ZmqPublisher zmqPub_ : PUB identity + face_registered (5566)
+        -sqlite3* facesDb_ : SQLite database for known face embeddings
+        -unordered_map~string, vector~float~~ knownFaces_ : Name → embedding cache (loaded from DB at init)
+        -bool running_
+        +initialize() : void
+        +run() : void
+        +registerFace(name, bgrData, width, height) : bool
+        +stop() : void
+        -identify(embedding, dim) : pair~string, float~
+        -loadFacesFromDb() : void
+    }
+    class FaceRecognitionNode_Config {
+        <<Config>>
+        +string modelPackPath : InspireFace Megatron_TRT model pack
+        +float recognitionThreshold = 0.45 : Cosine similarity threshold
+        +string knownFacesDb : SQLite face embedding database path
+        +string zmqSubEndpoint = "tcp://127.0.0.1:5555"
+        +string zmqCmdEndpoint = "tcp://127.0.0.1:5570"
+        +string zmqPubEndpoint = "tcp://127.0.0.1:5566"
+    }
+    FaceRecognitionNode --> FaceRecognitionNode_Config
+    FaceRecognitionNode --> PinnedStagingBuffer
+    FaceRecognitionNode --> SharedMemoryConsumer
+    FaceRecognitionNode --> ZmqSubscriber
+    FaceRecognitionNode --> ZmqPublisher
+    note for FaceRecognitionNode "**Two paths:**\n1. Every 3rd frame: detect → align → embed → match → PUB identity\n2. On register_face cmd: detect → align → embed → INSERT into SQLite\nOutput identity: {name, confidence, bbox, landmarks}\nOutput face_registered: {name, success, error_msg}"
 ```
 
 ```mermaid
-classDiagram    class BackgroundBlurNode {        +Config config_        -ICudaEngine* engine_ : YOLOv8n-seg TensorRT engine        -IExecutionContext* context_        -Ptr~cuda::Filter~ gaussianFilter_ : OpenCV CUDA Gaussian blur        -nvjpegHandle_t nvjpegHandle_ : GPU-accelerated JPEG encoder        -nvjpegEncoderState_t nvjpegState_        -PinnedStagingBuffer stagingBuffer_        -SharedMemoryConsumer shmConsumer_ : Reads source BGR frames        -SharedMemoryProducer shmProducer_ : Writes composited JPEG output        -ZmqSubscriber zmqSub_ : Receives frame notifications        -ZmqPublisher zmqPub_ : Notifies frontend of blurred frame        -cudaStream_t stream_        -bool running_        +initialize() : void        +run() : void        +stop() : void        -preprocess(src: GpuMat, dInput, stream) : void        -postprocessMask(dOutput, origW, origH, stream) : GpuMat        -composite(frame, mask, output, stream) : void        -encodeJpeg(frame: GpuMat, stream) : vector~uint8_t~    }    class BackgroundBlurNode_Config {        <<Config>>        +string yolov8EnginePath : yolov8n-seg.engine        +int inputWidth = 1920        +int inputHeight = 1080        +int blurKernelSize = 51 : Gaussian blur kernel        +int jpegQuality = 85 : nvJPEG output quality        +string zmqSubEndpoint = "tcp://127.0.0.1:5555"        +string zmqPubEndpoint = "tcp://127.0.0.1:5567"        +string outputShmName = "/oe.cv.blur.jpeg"    }    BackgroundBlurNode --> BackgroundBlurNode_Config    BackgroundBlurNode --> PinnedStagingBuffer    BackgroundBlurNode --> SharedMemoryConsumer    BackgroundBlurNode --> SharedMemoryProducer    BackgroundBlurNode --> ZmqSubscriber    BackgroundBlurNode --> ZmqPublisher    note for BackgroundBlurNode "All GPU — no CPU roundtrip:nYOLOv8-seg [1,3,640,640] FP16 → person maskn→ upscale to 1920×1080 → composite sharpnforeground over Gaussian-blurred backgroundn→ nvJPEG encode → output shm"
+classDiagram
+    class BackgroundBlurNode {
+        +Config config_
+        -ICudaEngine* engine_ : YOLOv8n-seg TensorRT engine
+        -IExecutionContext* context_
+        -Ptr~cuda::Filter~ gaussianFilter_ : OpenCV CUDA Gaussian blur
+        -nvjpegHandle_t nvjpegHandle_ : GPU-accelerated JPEG encoder
+        -nvjpegEncoderState_t nvjpegState_
+        -PinnedStagingBuffer stagingBuffer_
+        -SharedMemoryConsumer shmConsumer_ : Reads source BGR frames
+        -SharedMemoryProducer shmProducer_ : Writes composited JPEG output
+        -ZmqSubscriber zmqSub_ : Receives frame notifications
+        -ZmqPublisher zmqPub_ : Notifies frontend of blurred frame
+        -cudaStream_t stream_
+        -bool running_
+        +initialize() : void
+        +run() : void
+        +stop() : void
+        -preprocess(src: GpuMat, dInput, stream) : void
+        -postprocessMask(dOutput, origW, origH, stream) : GpuMat
+        -composite(frame, mask, output, stream) : void
+        -encodeJpeg(frame: GpuMat, stream) : vector~uint8_t~
+    }
+    class BackgroundBlurNode_Config {
+        <<Config>>
+        +string yolov8EnginePath : yolov8n-seg.engine
+        +int inputWidth = 1920
+        +int inputHeight = 1080
+        +int blurKernelSize = 51 : Gaussian blur kernel
+        +int jpegQuality = 85 : nvJPEG output quality
+        +string zmqSubEndpoint = "tcp://127.0.0.1:5555"
+        +string zmqPubEndpoint = "tcp://127.0.0.1:5567"
+        +string outputShmName = "/oe.cv.blur.jpeg"
+    }
+    BackgroundBlurNode --> BackgroundBlurNode_Config
+    BackgroundBlurNode --> PinnedStagingBuffer
+    BackgroundBlurNode --> SharedMemoryConsumer
+    BackgroundBlurNode --> SharedMemoryProducer
+    BackgroundBlurNode --> ZmqSubscriber
+    BackgroundBlurNode --> ZmqPublisher
+    note for BackgroundBlurNode "All GPU — no CPU roundtrip:\nYOLOv8-seg [1,3,640,640] FP16 → person mask\n→ upscale to 1920×1080 → composite sharp\nforeground over Gaussian-blurred background\n→ nvJPEG encode → output shm"
 ```
 
 ### **WebSocket Frontend Bridge (uWebSockets)**
 
 ```mermaid
-classDiagram    class PerSocketData {        <<struct>>        +bool webcamEnabled = true        +bool micEnabled = true    }    class WebSocketBridge {        +Config config_        -uWS::App* app_ : uWebSockets server instance        -ZmqSubscriber zmqSub_ : Polls blurred JPEG frames        -ZmqPublisher zmqPub_ : Relays UI commands to orchestrator        -thread relayThread_ : ZMQ → WebSocket broadcast thread        -atomic~bool~ running_        +initialize() : void        +run() : void        +stop() : void        -zmqToWsRelayLoop() : void        -handleClientCommand(command: json) : void    }    class WebSocketBridge_Config {        <<Config>>        +int wsPort = 9001        +string videoEndpoint = "/video" : Binary JPEG stream at 30fps        +string audioEndpoint = "/audio" : Binary PCM stream (TTS playback)        +string chatEndpoint = "/chat" : Bidirectional JSON commands + text        +string zmqSubEndpoint = "tcp://127.0.0.1:5567"        +string zmqPubEndpoint = "tcp://127.0.0.1:5570"    }    WebSocketBridge --> WebSocketBridge_Config    WebSocketBridge --> PerSocketData : per-connection state    WebSocketBridge --> ZmqSubscriber    WebSocketBridge --> ZmqPublisher    note for WebSocketBridge "Endpoints:n/video — binary JPEG stream at 30fpsn/audio — binary PCM stream (TTS playback)n/chat — bidirectional JSON commands + textnGET / — serves static HTML/JS/CSSnUI commands: {action:push_to_talk, state:true}"
+classDiagram
+    class PerSocketData {
+        <<struct>>
+        +bool webcamEnabled = true
+        +bool micEnabled = true
+    }
+    class WebSocketBridge {
+        +Config config_
+        -uWS::App* app_ : uWebSockets server instance
+        -ZmqSubscriber zmqSub_ : Polls blurred JPEG frames
+        -ZmqPublisher zmqPub_ : Relays UI commands to orchestrator
+        -thread relayThread_ : ZMQ → WebSocket broadcast thread
+        -atomic~bool~ running_
+        +initialize() : void
+        +run() : void
+        +stop() : void
+        -zmqToWsRelayLoop() : void
+        -handleClientCommand(command: json) : void
+    }
+    class WebSocketBridge_Config {
+        <<Config>>
+        +int wsPort = 9001
+        +string videoEndpoint = "/video" : Binary JPEG stream at 30fps
+        +string audioEndpoint = "/audio" : Binary PCM stream (TTS playback)
+        +string chatEndpoint = "/chat" : Bidirectional JSON commands + text
+        +string zmqSubEndpoint = "tcp://127.0.0.1:5567"
+        +string zmqPubEndpoint = "tcp://127.0.0.1:5570"
+    }
+    WebSocketBridge --> WebSocketBridge_Config
+    WebSocketBridge --> PerSocketData : per-connection state
+    WebSocketBridge --> ZmqSubscriber
+    WebSocketBridge --> ZmqPublisher
+    note for WebSocketBridge "Endpoints:\n/video — binary JPEG stream at 30fps\n/audio — binary PCM stream (TTS playback)\n/chat — bidirectional JSON commands + text\nGET / — serves static HTML/JS/CSS\nUI commands: {action:push_to_talk, state:true}"
 ```
 
 > **Architectural note: WebSocketBridge is a growing monolith.** It currently subscribes to 6 PUB ports, publishes on 1, serves HTTP `/status`, serves static files, manages per-socket state, and bridges ZMQ↔WS for video/audio/chat/module_status/face_registered/vlm_description. Every new module adds another SUB endpoint. This violates the single-responsibility principle that every other module follows. **Future refactoring path:** Split into `oe_ws_video` (JPEG relay only), `oe_ws_control` (JSON commands + status), and a shared `oe_http` (static files + `/status`). Each would be a separate process with its own ZMQ subscriptions. This is not urgent — the bridge's CPU load is minimal — but should be planned for when module count exceeds ~12.
@@ -2483,7 +3193,38 @@ classDiagram    class PerSocketData {        <<struct>>        +bool webcamEnabl
 ### **Master Orchestrator Daemon**
 
 ```mermaid
-classDiagram    class ModuleDescriptor {        <<struct>>        +string name : e.g. "face_recognition"        +string binary_path : e.g. "./build/bin/face_recognition_node"        +vector~string~ args : Command-line arguments        +string zmq_heartbeat_endpoint : Heartbeat monitoring address        +pid_t pid = -1 : OS process ID after spawn        +int restartCount = 0 : Crash recovery counter        +int maxRestarts = 5 : Maximum auto-restart attempts    }    class OmniEdgeDaemon {        +Config config_        -vector~ModuleDescriptor~ modules_ : All managed child processes        -ZmqWatchdog watchdog_ : Heartbeat monitor        -bool running_        +initialize() : void        +launchAll() : void        +watchdogLoop() : void        +shutdown() : void        -spawnModule(module) : pid_t        -restartModule(module) : void    }    class OmniEdgeDaemon_Config {        <<Config>>        +string configFile : YAML/JSON config for all modules        +int watchdogPollMs = 1000    }    OmniEdgeDaemon --> OmniEdgeDaemon_Config    OmniEdgeDaemon --> ModuleDescriptor : manages 1..*    OmniEdgeDaemon --> ZmqWatchdog : monitors heartbeats    note for OmniEdgeDaemon "Launch order (dependency-sorted):n1. GStreamer Video/Audio Ingestn2. Face Recognition + Background Blurn3. Whisper STTn4. Kokoro TTSn5. Moondream2 VLMn6. Qwen LLMn7. WebSocket BridgenUses posix_spawn() for each module.nSIGTERM + restart on heartbeat failure."
+classDiagram
+    class ModuleDescriptor {
+        <<struct>>
+        +string name : e.g. "face_recognition"
+        +string binary_path : e.g. "./build/bin/face_recognition_node"
+        +vector~string~ args : Command-line arguments
+        +string zmq_heartbeat_endpoint : Heartbeat monitoring address
+        +pid_t pid = -1 : OS process ID after spawn
+        +int restartCount = 0 : Crash recovery counter
+        +int maxRestarts = 5 : Maximum auto-restart attempts
+    }
+    class OmniEdgeDaemon {
+        +Config config_
+        -vector~ModuleDescriptor~ modules_ : All managed child processes
+        -ZmqWatchdog watchdog_ : Heartbeat monitor
+        -bool running_
+        +initialize() : void
+        +launchAll() : void
+        +watchdogLoop() : void
+        +shutdown() : void
+        -spawnModule(module) : pid_t
+        -restartModule(module) : void
+    }
+    class OmniEdgeDaemon_Config {
+        <<Config>>
+        +string configFile : YAML/JSON config for all modules
+        +int watchdogPollMs = 1000
+    }
+    OmniEdgeDaemon --> OmniEdgeDaemon_Config
+    OmniEdgeDaemon --> ModuleDescriptor : manages 1..*
+    OmniEdgeDaemon --> ZmqWatchdog : monitors heartbeats
+    note for OmniEdgeDaemon "Launch order (dependency-sorted):\n1. WebSocket Bridge (must be up first)\n2. GStreamer Video/Audio Ingest\n3. Face Recognition + Background Blur\n4. Whisper STT\n5. Kokoro TTS\n6. Qwen LLM\n7. Moondream2 VLM (on-demand on lower tiers)\n8. FLUX ImgGen (always on-demand)\nUses posix_spawn() for each module.\nSIGTERM + restart on heartbeat failure."
 ```
 
 ---
@@ -2491,13 +3232,172 @@ classDiagram    class ModuleDescriptor {        <<struct>>        +string name :
 ## **Recommended CMake Project Structure**
 
 ```
-OmniEdge_AI/├── CMakeLists.txt                    # Root CMake: C++20, CUDA 20, find_package()├── cmake/│   ├── FindTensorRT.cmake│   ├── FindTensorRTLLM.cmake│   ├── FindZeroMQ.cmake│   └── FindInspireFace.cmake├── common/                           # Shared infrastructure library│   ├── CMakeLists.txt                # Builds libomniedge_common.a│   ├── shared_memory.hpp / .cpp│   ├── pinned_buffer.hpp / .cpp│   ├── zmq_control_plane.hpp / .cpp│   ├── oe_defaults.hpp              # Runtime defaults for all YAML-configurable params (constexpr)│   └── oe_expected.hpp              # tl::expected polyfill alias → switches to std::expected on C++23├── config/                           # Compile-time tuning — no hardcoded numbers in modules│   ├── oe_tuning.hpp                 # Hardware-class tuning: buffer sizes, ZMQ HWM, CUDA grid dims│   └── oe_platform.hpp              # Platform detection: WSL2 vs native, CUDA SM gates, driver path├── modules/│   ├── gstreamer_ingest/│   │   ├── CMakeLists.txt            # Target: omniedge_video_ingest, omniedge_audio_ingest│   │   ├── video_ingest.hpp / .cpp│   │   ├── audio_ingest.hpp / .cpp│   │   └── main_video.cpp / main_audio.cpp│   ├── llm/│   │   ├── CMakeLists.txt            # Target: omniedge_llm│   │   ├── qwen_llm_node.hpp / .cpp│   │   └── main.cpp│   ├── vlm/│   │   ├── CMakeLists.txt            # Target: omniedge_vlm│   │   ├── moondream_vlm_node.hpp / .cpp│   │   └── main.cpp│   ├── stt/│   │   ├── CMakeLists.txt            # Target: omniedge_stt│   │   ├── whisper_stt_node.hpp / .cpp│   │   └── main.cpp│   ├── tts/│   │   ├── CMakeLists.txt            # Target: omniedge_tts│   │   ├── kokoro_tts_node.hpp / .cpp│   │   └── main.cpp│   ├── cv/│   │   ├── CMakeLists.txt            # Target: omniedge_face_recog, omniedge_bg_blur│   │   ├── face_recognition_node.hpp / .cpp│   │   ├── background_blur_node.hpp / .cpp│   │   ├── main_face.cpp│   │   └── main_blur.cpp│   └── orchestrator/│       ├── CMakeLists.txt            # Target: omniedge_daemon, omniedge_ws_bridge│       ├── omniedge_daemon.hpp / .cpp│       ├── websocket_bridge.hpp / .cpp│       ├── main_daemon.cpp│       └── main_ws.cpp├── models/                           # Git-ignored; holds converted engines│   ├── trt_engines/│   │   ├── qwen2.5-7b-awq/│   │   ├── whisper-turbo/│   │   ├── moondream2_vision.engine│   │   ├── moondream2_decoder.engine│   │   └── yolov8n-seg.engine│   └── onnx/│       └── kokoro-v1_0-int8.onnx├── frontend/                         # JavaScript browser UI│   ├── index.html│   ├── app.js│   └── style.css├── scripts/│   ├── convert_qwen_awq.py│   ├── export_moondream_onnx.py│   ├── quantize_kokoro_onnx.py│   ├── build_all_engines.sh          # Master script to run all conversions│   └── gstreamer_host_producer.bat   # Windows host GStreamer launch command└── tests/                            # Google Test (gtest) — every .cpp has a test    ├── CMakeLists.txt                # Builds all test targets, links GTest::gtest_main    ├── common/    │   ├── test_shared_memory.cpp     # ShmFrameHeader round-trip, producer/consumer read-back    │   ├── test_pinned_buffer.cpp     # cudaHostAlloc staging, DMA transfer verification    │   └── test_zmq_control_plane.cpp # PUB/SUB delivery, conflation, watchdog heartbeat    ├── gstreamer_ingest/    │   ├── test_video_ingest.cpp      # Mock appsink callback, shm write + ZMQ publish    │   └── test_audio_ingest.cpp      # PCM chunk write, sample rate / format validation    ├── llm/    │   └── test_qwen_llm_node.cpp     # Tokenize/detokenize round-trip, single-shot generate()    ├── vlm/    │   └── test_moondream_vlm.cpp     # Preprocess dimensions, describe_frame() on test image    ├── stt/    │   └── test_whisper_stt.cpp       # Mel spectrogram shape, transcribe() on known audio clip    ├── tts/    │   └── test_kokoro_tts.cpp        # Phoneme tokenization, synthesize() output sample count    ├── cv/    │   ├── test_face_recognition.cpp  # registerFace + identify round-trip, threshold edge cases    │   └── test_background_blur.cpp   # Mask shape, composite output dimensions, JPEG encode    └── orchestrator/        ├── test_websocket_bridge.cpp  # JSON command parsing, mock WS client connect        └── test_omniedge_daemon.cpp     # Module spawn/restart, watchdog timeout behavior
+OmniEdge_AI/
+├── CMakeLists.txt                    # Root CMake: C++20, CUDA 20, find_package()
+├── cmake/
+│   ├── FindTensorRT.cmake
+│   ├── FindTensorRTLLM.cmake
+│   ├── FindZeroMQ.cmake
+│   └── FindInspireFace.cmake
+├── common/                           # Shared infrastructure library
+│   ├── CMakeLists.txt                # Builds libomniedge_common.a
+│   ├── shared_memory.hpp / .cpp
+│   ├── pinned_buffer.hpp / .cpp
+│   ├── zmq_control_plane.hpp / .cpp
+│   ├── oe_defaults.hpp              # Runtime defaults for all YAML-configurable params (constexpr)
+│   └── oe_expected.hpp              # tl::expected polyfill alias → switches to std::expected on C++23
+├── config/                           # Compile-time tuning — no hardcoded numbers in modules
+│   ├── oe_tuning.hpp                 # Hardware-class tuning: buffer sizes, ZMQ HWM, CUDA grid dims
+│   └── oe_platform.hpp              # Platform detection: WSL2 vs native, CUDA SM gates, driver path
+├── modules/
+│   ├── gstreamer_ingest/
+│   │   ├── CMakeLists.txt            # Target: omniedge_video_ingest, omniedge_audio_ingest
+│   │   ├── video_ingest.hpp / .cpp
+│   │   ├── audio_ingest.hpp / .cpp
+│   │   └── main_video.cpp / main_audio.cpp
+│   ├── llm/
+│   │   ├── CMakeLists.txt            # Target: omniedge_llm
+│   │   ├── qwen_llm_node.hpp / .cpp
+│   │   └── main.cpp
+│   ├── vlm/
+│   │   ├── CMakeLists.txt            # Target: omniedge_vlm
+│   │   ├── moondream_vlm_node.hpp / .cpp
+│   │   ├── encode_moondream_image.py  # Vision encoder subprocess (posix_spawn)
+│   │   └── main.cpp
+│   ├── stt/
+│   │   ├── CMakeLists.txt            # Target: omniedge_stt
+│   │   ├── whisper_stt_node.hpp / .cpp
+│   │   └── main.cpp
+│   ├── tts/
+│   │   ├── CMakeLists.txt            # Target: omniedge_tts
+│   │   ├── kokoro_tts_node.hpp / .cpp
+│   │   └── main.cpp
+│   ├── cv/
+│   │   ├── CMakeLists.txt            # Target: omniedge_face_recog, omniedge_bg_blur
+│   │   ├── face_recognition_node.hpp / .cpp
+│   │   ├── background_blur_node.hpp / .cpp
+│   │   ├── main_face.cpp
+│   │   └── main_blur.cpp
+│   └── orchestrator/
+│       ├── CMakeLists.txt            # Target: omniedge_daemon, omniedge_ws_bridge
+│       ├── omniedge_daemon.hpp / .cpp
+│       ├── websocket_bridge.hpp / .cpp
+│       ├── main_daemon.cpp
+│       └── main_ws.cpp
+├── models/                           # Git-ignored; holds converted engines
+│   ├── trt_engines/
+│   │   ├── qwen2.5-7b-awq/
+│   │   ├── whisper-turbo/
+│   │   ├── moondream2_vision.engine
+│   │   ├── moondream2_decoder.engine
+│   │   └── yolov8n-seg.engine
+│   └── onnx/
+│       └── kokoro-v1_0-int8.onnx
+├── frontend/                         # JavaScript browser UI
+│   ├── index.html
+│   ├── app.js
+│   └── style.css
+├── scripts/
+│   ├── install/                      # Installation and verification phases
+│   │   ├── run_all_phases.sh        # Run all 8 phases sequentially
+│   │   ├── check_prerequisites.sh   # Validate prerequisites before install
+│   │   ├── phase_N_install.sh       # Install phase N
+│   │   └── phase_N_verify.sh        # Verify phase N
+│   ├── quantize/                     # Model quantization and engine builds
+│   │   ├── quantize_qwen_awq.py     # AWQ quantization for Qwen 2.5 7B
+│   │   └── build_trt_engines.sh     # Master script to run all TRT conversions
+│   ├── benchmark/                    # Performance benchmarks
+│   │   └── benchmark_voice_pipeline.sh
+│   └── accuracy/                     # Accuracy regression tests
+│       ├── eval_llm_accuracy.py
+│       └── eval_*.py
+└── tests/                            # Google Test (gtest) — every .cpp has a test
+    ├── CMakeLists.txt                # Builds all test targets, links GTest::gtest_main
+    ├── common/
+    │   ├── test_shared_memory.cpp     # ShmFrameHeader round-trip, producer/consumer read-back
+    │   ├── test_pinned_buffer.cpp     # cudaHostAlloc staging, DMA transfer verification
+    │   └── test_zmq_control_plane.cpp # PUB/SUB delivery, conflation, watchdog heartbeat
+    ├── gstreamer_ingest/
+    │   ├── test_video_ingest.cpp      # Mock appsink callback, shm write + ZMQ publish
+    │   └── test_audio_ingest.cpp      # PCM chunk write, sample rate / format validation
+    ├── llm/
+    │   └── test_qwen_llm_node.cpp     # Tokenize/detokenize round-trip, single-shot generate()
+    ├── vlm/
+    │   └── test_moondream_vlm.cpp     # Preprocess dimensions, describe_frame() on test image
+    ├── stt/
+    │   └── test_whisper_stt.cpp       # Mel spectrogram shape, transcribe() on known audio clip
+    ├── tts/
+    │   └── test_kokoro_tts.cpp        # Phoneme tokenization, synthesize() output sample count
+    ├── cv/
+    │   ├── test_face_recognition.cpp  # registerFace + identify round-trip, threshold edge cases
+    │   └── test_background_blur.cpp   # Mask shape, composite output dimensions, JPEG encode
+    └── orchestrator/
+        ├── test_websocket_bridge.cpp  # JSON command parsing, mock WS client connect
+        └── test_omniedge_daemon.cpp     # Module spawn/restart, watchdog timeout behavior
 ```
 
 ### **Root CMakeLists.txt (Skeleton)**
 
 ```cmake
-cmake_minimum_required(VERSION 3.20)project(OmniEdge_AI LANGUAGES CXX CUDA)set(CMAKE_CXX_STANDARD 20)set(CMAKE_CXX_STANDARD_REQUIRED ON)set(CMAKE_CUDA_STANDARD 20)# GPU architecture compatibility — Turing through Blackwell# Override at configure time:  cmake -DCMAKE_CUDA_ARCHITECTURES=100aif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)	set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;90a;100a")endif()# Find required packagesfind_package(CUDA REQUIRED)find_package(CUDAToolkit REQUIRED)list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")find_package(TensorRT REQUIRED)find_package(ZeroMQ REQUIRED)find_package(PkgConfig REQUIRED)pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)find_package(OpenCV REQUIRED COMPONENTS core imgproc cudaimgproc cudafilters)# ONNX Runtime (for Kokoro TTS)set(ONNXRUNTIME_ROOT "/usr/local/onnxruntime" CACHE PATH "ONNX Runtime root")find_library(ONNXRUNTIME_LIB onnxruntime PATHS ${ONNXRUNTIME_ROOT}/lib)# nlohmann/json (header-only)include(FetchContent)FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)FetchContent_MakeAvailable(json)# uWebSocketsFetchContent_Declare(uWebSockets GIT_REPOSITORY https://github.com/uNetworking/uWebSockets.git GIT_TAG v20.64.0)FetchContent_MakeAvailable(uWebSockets)# Google TestFetchContent_Declare(googletest    GIT_REPOSITORY https://github.com/google/googletest.git    GIT_TAG v1.15.2)set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)FetchContent_MakeAvailable(googletest)# Common libraryadd_subdirectory(common)# Module executablesadd_subdirectory(modules/gstreamer_ingest)add_subdirectory(modules/llm)add_subdirectory(modules/vlm)add_subdirectory(modules/stt)add_subdirectory(modules/tts)add_subdirectory(modules/cv)add_subdirectory(modules/orchestrator)# Testsenable_testing()add_subdirectory(tests)
+cmake_minimum_required(VERSION 3.20)
+project(OmniEdge_AI LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+
+# GPU architecture compatibility — Turing through Blackwell
+# Override at configure time:  cmake -DCMAKE_CUDA_ARCHITECTURES=100a
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90;90a;100a")
+endif()
+
+# Find required packages
+find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+find_package(TensorRT REQUIRED)
+find_package(ZeroMQ REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc cudaimgproc cudafilters)
+
+# ONNX Runtime (for Kokoro TTS)
+set(ONNXRUNTIME_ROOT "/usr/local/onnxruntime" CACHE PATH "ONNX Runtime root")
+find_library(ONNXRUNTIME_LIB onnxruntime PATHS ${ONNXRUNTIME_ROOT}/lib)
+
+# nlohmann/json (header-only)
+include(FetchContent)
+FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+FetchContent_MakeAvailable(json)
+
+# uWebSockets
+FetchContent_Declare(uWebSockets GIT_REPOSITORY https://github.com/uNetworking/uWebSockets.git GIT_TAG v20.64.0)
+FetchContent_MakeAvailable(uWebSockets)
+
+# Google Test
+FetchContent_Declare(googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2
+)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+# Common library
+add_subdirectory(common)
+
+# Module executables
+add_subdirectory(modules/gstreamer_ingest)
+add_subdirectory(modules/llm)
+add_subdirectory(modules/vlm)
+add_subdirectory(modules/stt)
+add_subdirectory(modules/tts)
+add_subdirectory(modules/cv)
+add_subdirectory(modules/orchestrator)
+
+# Tests
+enable_testing()
+add_subdirectory(tests)
 ```
 
 ### **tests/CMakeLists.txt**
@@ -2505,7 +3405,29 @@ cmake_minimum_required(VERSION 3.20)project(OmniEdge_AI LANGUAGES CXX CUDA)set(C
 Every `.hpp`/`.cpp` pair must have a corresponding `test_*.cpp` file. Each test binary links against `GTest::gtest_main` (provides `main()` automatically) and the library it is testing. Tests that require a GPU or TensorRT engine are tagged with `LABELS gpu` so CI can skip them on CPU-only runners.
 
 ```cmake
-include(GoogleTest)# ── Common library tests (no GPU needed) ─────────────────add_executable(test_shared_memory common/test_shared_memory.cpp)target_link_libraries(test_shared_memory PRIVATE omniedge_common GTest::gtest_main)gtest_discover_tests(test_shared_memory)add_executable(test_pinned_buffer common/test_pinned_buffer.cpp)target_link_libraries(test_pinned_buffer PRIVATE omniedge_common CUDA::cudart GTest::gtest_main)gtest_discover_tests(test_pinned_buffer PROPERTIES LABELS gpu)add_executable(test_zmq_control_plane common/test_zmq_control_plane.cpp)target_link_libraries(test_zmq_control_plane PRIVATE omniedge_common ${ZeroMQ_LIBRARIES} GTest::gtest_main)gtest_discover_tests(test_zmq_control_plane)# ── Module tests (each mirrors one .cpp) ─────────────────# Pattern: one test executable per source file, linked to its module lib + gtest# GPU-dependent tests get LABELS gpu so `ctest -L gpu` or `ctest -LE gpu` can filter.# Example for LLM module:add_executable(test_qwen_llm_node llm/test_qwen_llm_node.cpp)target_link_libraries(test_qwen_llm_node PRIVATE omniedge_llm_lib GTest::gtest_main)gtest_discover_tests(test_qwen_llm_node PROPERTIES LABELS gpu)# Repeat pattern for every module...
+include(GoogleTest)
+
+# ── Common library tests (no GPU needed) ─────────────────
+add_executable(test_shared_memory common/test_shared_memory.cpp)
+target_link_libraries(test_shared_memory PRIVATE omniedge_common GTest::gtest_main)
+gtest_discover_tests(test_shared_memory)
+
+add_executable(test_pinned_buffer common/test_pinned_buffer.cpp)
+target_link_libraries(test_pinned_buffer PRIVATE omniedge_common CUDA::cudart GTest::gtest_main)
+gtest_discover_tests(test_pinned_buffer PROPERTIES LABELS gpu)
+
+add_executable(test_zmq_control_plane common/test_zmq_control_plane.cpp)
+target_link_libraries(test_zmq_control_plane PRIVATE omniedge_common ${ZeroMQ_LIBRARIES} GTest::gtest_main)
+gtest_discover_tests(test_zmq_control_plane)
+
+# ── Module tests (each mirrors one .cpp) ─────────────────
+# Pattern: one test executable per source file, linked to its module lib + gtest
+# GPU-dependent tests get LABELS gpu so `ctest -L gpu` or `ctest -LE gpu` can filter.
+# Example for LLM module:
+add_executable(test_qwen_llm_node llm/test_qwen_llm_node.cpp)
+target_link_libraries(test_qwen_llm_node PRIVATE omniedge_llm_lib GTest::gtest_main)
+gtest_discover_tests(test_qwen_llm_node PROPERTIES LABELS gpu)
+# Repeat pattern for every module...
 ```
 
 ### **Unit Testing Methodology**
@@ -2586,7 +3508,7 @@ A reproducible benchmark script measures end-to-end latency for the core voice p
 #!/usr/bin/env bash# benchmark_voice_pipeline.sh — Measure PTT-to-audio latencyset -euo pipefailAUDIO_FILE="test_data/hello_omniedge_3s.wav"ITERATIONS=20RESULTS_FILE="/tmp/omniedge_bench_$(date +%Y%m%d_%H%M%S).csv"echo "iteration,stt_ms,llm_ttft_ms,llm_total_ms,tts_ms,e2e_ms" > "$RESULTS_FILE"for i in $(seq 1 $ITERATIONS); do  # Inject audio via shared memory (simulates PTT press)  T0=$(date +%s%N)  ./build/bin/bench_inject_audio "$AUDIO_FILE"  # Wait for tts_audio ZMQ message (blocking with timeout)  RESULT=$(./build/bin/bench_wait_tts --timeout-ms=5000 --json)  T1=$(date +%s%N)  E2E_MS=$(( (T1 - T0) / 1000000 ))  STT_MS=$(echo "$RESULT" | jq .stt_ms)  TTFT_MS=$(echo "$RESULT" | jq .llm_ttft_ms)  LLM_MS=$(echo "$RESULT" | jq .llm_total_ms)  TTS_MS=$(echo "$RESULT" | jq .tts_ms)  echo "$i,$STT_MS,$TTFT_MS,$LLM_MS,$TTS_MS,$E2E_MS" >> "$RESULTS_FILE"  echo "[$i/$ITERATIONS] E2E=${E2E_MS}ms  STT=${STT_MS}ms  TTFT=${TTFT_MS}ms  LLM=${LLM_MS}ms  TTS=${TTS_MS}ms"doneecho "Results saved to $RESULTS_FILE"# Print summary statisticsawk -F, 'NR>1 {sum+=$6; if($6>max)max=$6; if(min==""||$6<min)min=$6} END {printf "E2E — min: %dms  avg: %dms  max: %dms  (n=%d)n", min, sum/(NR-1), max, NR-1}' "$RESULTS_FILE"
 ```
 
-**Target latencies (P50) — must match the [End-to-End Latency Budget](#end-to-end-latency-budget-rtx-3060-12-gb-ampere):**
+**Target latencies (P50) — must match the [End-to-End Latency Budget](#end-to-end-latency-budget-standard-tier-12-gb):**
 
 | Stage | Target | Budget Rationale |
 |:---|:---|:---|
@@ -2744,6 +3666,7 @@ When choosing which model to downgrade, the daemon follows this priority (lowest
 
 | Priority | Module | Original VRAM | Downgrade To | Savings | User Impact |
 |:---:|:---|:---|:---|:---|:---|
+| -1 | ImgGen (FLUX.1-schnell) | 4.5 GB | Disabled (on-demand only, evict immediately) | 4.5 GB | `text_to_image` unavailable |
 | 0 | BackgroundBlur | 0.5 GB | Disabled (raw video passthrough) | 0.5 GB | Cosmetic only |
 | 1 | VLM (Moondream2) | 2.45 GB | Already on-demand (evict immediately) | 2.45 GB | `describe_scene` unavailable |
 | 2 | FaceRecognition | 0.5 GB | Disabled | 0.5 GB | No identity context in LLM prompt |
@@ -2931,20 +3854,34 @@ With current model performance:
 
 ### Architecture
 
-The frontend is a single-page application (SPA) served by the WebSocket bridge process (`omniedge_ws_bridge`) on port 9001. It consists of three files:
+The frontend is a single-page application (SPA) served by the WebSocket bridge process (`omniedge_ws_bridge`) on port 9001. No npm, no bundler, no build step — vanilla JavaScript only.
 
 ```
-frontend/├── index.html    # Layout: video feed, controls, chat transcript, status indicators├── app.js        # Core logic: WebSocket connections, audio playback, UI state└── style.css     # Styling, responsive layout, dark mode
+frontend/
+├── index.html          # Layout: video canvas, controls, chat transcript, status sidebar
+├── style.css           # Styling, responsive layout, dark mode
+└── js/
+    ├── ws.js           # WebSocket connection manager (3 channels, reconnect with backoff)
+    ├── video.js        # Binary JPEG → canvas rendering, shape overlay canvas
+    ├── audio.js        # PCM float32 → AudioContext 24 kHz playback, sentence queue
+    ├── chat.js         # Token streaming display, conversation history, text input
+    ├── ptt.js          # Push-to-talk button (mousedown/touchstart/Space)
+    ├── controls.js     # Describe scene, register face, image generation buttons
+    ├── status.js       # Module status sidebar indicators, degradation matrix
+    └── image_adjust.js # Brightness/contrast/saturation/sharpness sliders
 ```
 
 ### WebSocket Channels
 
-The frontend maintains two WebSocket connections:
+The frontend maintains **three** WebSocket connections, one per data type:
 
 | Channel | URL | Data Type | Direction | Purpose |
 |:---|:---|:---|:---|:---|
-| **Video** | `ws://localhost:9001/video` | Binary (`ArrayBuffer`) | Server → Client | JPEG frames from BackgroundBlur (or raw video if blur is down) |
-| **Control** | `ws://localhost:9001/chat` | JSON text | Bidirectional | Commands (PTT, describe_scene, text_input) and events (transcription, llm_response, module_status, tts_audio) |
+| **Video** | `ws://localhost:9001/video` | Binary (`ArrayBuffer`) | Server → Client | JPEG frames from BackgroundBlurNode (or raw video if blur is down) |
+| **Audio** | `ws://localhost:9001/audio` | Binary (`ArrayBuffer`) | Server → Client | PCM float32 audio from KokoroTTSNode for streaming playback |
+| **Chat** | `ws://localhost:9001/chat` | JSON text | Bidirectional | Commands (PTT, describe_scene, text_input, set_image_adjust, update_shapes, set_mode) and events (transcription, llm_response, module_status, identity, vlm_description, face_registered, generated_image, daemon_state, error) |
+
+Each channel uses independent WebSocket instances with exponential backoff reconnection (500 ms initial, 30 s cap). Separating binary and JSON traffic prevents framing overhead and simplifies message routing.
 
 ### Frontend State Machine
 
@@ -2956,7 +3893,7 @@ The frontend maintains two WebSocket connections:
 
 | Function | Trigger | What It Does |
 |:---|:---|:---|
-| `connectWebSockets()` | Page load | Opens `/video` and `/chat` WebSocket connections with auto-reconnect |
+| `connectWebSockets()` | Page load | Opens `/video`, `/audio`, and `/chat` WebSocket connections with auto-reconnect |
 | `onPttPress()` | PTT button mousedown / touchstart | Sends `{"action":"push_to_talk","state":true}`, transitions to LISTENING |
 | `onPttRelease()` | PTT button mouseup / touchend | Sends `{"action":"push_to_talk","state":false}`, transitions to PROCESSING |
 | `onDescribeScene()` | "Describe Scene" button click | Sends `{"action":"describe_scene"}`, transitions to VISION_PROCESSING |

@@ -2821,7 +2821,29 @@ cmake_minimum_required(VERSION 3.20)project(OmniEdge_AI LANGUAGES CXX CUDA)set(C
 Every `.hpp`/`.cpp` pair must have a corresponding `test_*.cpp` file. Each test binary links against `GTest::gtest_main` (provides `main()` automatically) and the library it is testing. Tests that require a GPU or TensorRT engine are tagged with `LABELS gpu` so CI can skip them on CPU-only runners.
 
 ```cmake
-include(GoogleTest)# ── Common library tests (no GPU needed) ─────────────────add_executable(test_shared_memory common/test_shared_memory.cpp)target_link_libraries(test_shared_memory PRIVATE omniedge_common GTest::gtest_main)gtest_discover_tests(test_shared_memory)add_executable(test_pinned_buffer common/test_pinned_buffer.cpp)target_link_libraries(test_pinned_buffer PRIVATE omniedge_common CUDA::cudart GTest::gtest_main)gtest_discover_tests(test_pinned_buffer PROPERTIES LABELS gpu)add_executable(test_zmq_control_plane common/test_zmq_control_plane.cpp)target_link_libraries(test_zmq_control_plane PRIVATE omniedge_common ${ZeroMQ_LIBRARIES} GTest::gtest_main)gtest_discover_tests(test_zmq_control_plane)# ── Module tests (each mirrors one .cpp) ─────────────────# Pattern: one test executable per source file, linked to its module lib + gtest# GPU-dependent tests get LABELS gpu so `ctest -L gpu` or `ctest -LE gpu` can filter.# Example for LLM module:add_executable(test_qwen_llm_node llm/test_qwen_llm_node.cpp)target_link_libraries(test_qwen_llm_node PRIVATE omniedge_llm_lib GTest::gtest_main)gtest_discover_tests(test_qwen_llm_node PROPERTIES LABELS gpu)# Repeat pattern for every module...
+include(GoogleTest)
+
+# ── Common library tests (no GPU needed) ─────────────────
+add_executable(test_shared_memory common/test_shared_memory.cpp)
+target_link_libraries(test_shared_memory PRIVATE omniedge_common GTest::gtest_main)
+gtest_discover_tests(test_shared_memory)
+
+add_executable(test_pinned_buffer common/test_pinned_buffer.cpp)
+target_link_libraries(test_pinned_buffer PRIVATE omniedge_common CUDA::cudart GTest::gtest_main)
+gtest_discover_tests(test_pinned_buffer PROPERTIES LABELS gpu)
+
+add_executable(test_zmq_control_plane common/test_zmq_control_plane.cpp)
+target_link_libraries(test_zmq_control_plane PRIVATE omniedge_common ${ZeroMQ_LIBRARIES} GTest::gtest_main)
+gtest_discover_tests(test_zmq_control_plane)
+
+# ── Module tests (each mirrors one .cpp) ─────────────────
+# Pattern: one test executable per source file, linked to its module lib + gtest
+# GPU-dependent tests get LABELS gpu so `ctest -L gpu` or `ctest -LE gpu` can filter.
+# Example for LLM module:
+add_executable(test_qwen_llm_node llm/test_qwen_llm_node.cpp)
+target_link_libraries(test_qwen_llm_node PRIVATE omniedge_llm_lib GTest::gtest_main)
+gtest_discover_tests(test_qwen_llm_node PROPERTIES LABELS gpu)
+# Repeat pattern for every module...
 ```
 
 ### **Unit Testing Methodology**
