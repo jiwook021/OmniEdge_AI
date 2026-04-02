@@ -1,26 +1,26 @@
 @startuml OmniEdgeAI_Architecture
 
-title OmniEdge_AI — Microservice Architecture & Browser Interaction\nEdge AI Assistant · WSL2 · 4–16+ GB VRAM (4 tiers) · 9 Independent C++ Processes
+title OmniEdge_AI v2.3 — System Architecture & Interaction Flow\n12 Independent C++ Processes · WSL2 · NVIDIA RTX PRO 3000 Blackwell (12 GB) · 4 GPU Tiers
 autonumber
 
 skinparam sequenceArrowThickness 2
 skinparam roundcorner 10
-skinparam maxmessagesize 220
+skinparam maxmessagesize 240
 skinparam sequenceParticipant underline
 skinparam noteBackgroundColor #FFFDE7
 skinparam noteBorderColor #FBC02D
 skinparam sequenceGroupBorderColor #616161
 skinparam sequenceGroupHeaderFontSize 13
 
-' ── Participants ──────────────────────────────────────────
-' Each box = independent OS process (microservice).
-' Communication: ZMQ (control) + POSIX shm (data) only.
-' No process links to another's library or calls its functions.
-' SHM segments shown as self-arrows on producer/consumer.
+' ─────────────────────────────────────────────────────────────
+' Participants — each box is an independent OS process.
+' IPC: ZeroMQ (control) + POSIX SHM (data). No shared libs.
+' All modules use MessageRouter for consolidated ZMQ management.
+' ─────────────────────────────────────────────────────────────
 
 box "Ingestion" #E8F5E9
     participant "Video Ingest\nGStreamer · Port 5555" as GSV
-    participant "Audio Ingest\nGStreamer · Port 5556" as GSA
+    participant "Audio Ingest\nGStreamer+VAD · Port 5556" as GSA
 end box
 
 box "ZMQ PUB/SUB Bus" #FFF3E0
@@ -28,97 +28,100 @@ box "ZMQ PUB/SUB Bus" #FFF3E0
 end box
 
 box "Vision Nodes" #FCE4EC
-    participant "InspireFace\nFP16 ~0.5 GB\nPort 5566" as FR
-    participant "Background Blur\nYOLOv8-seg FP16 ~0.5 GB\nPort 5567" as BB
-    participant "Moondream2\nINT4 2.45 GB\nPort 5562" as VLM
+    participant "Face Recog\nInspireFace FP16\n0.5 GB · Port 5566" as FR
+    participant "Background Blur\nYOLOv8-seg FP16\n0.5 GB · Port 5567" as BB
+    participant "VLM\nMoondream2 INT4\n2.45 GB · Port 5562" as VLM
 end box
 
-box "Audio / Language Nodes" #FCE4EC
-    participant "Whisper V3\nINT8 1.5 GB\nPort 5563" as STT
-    participant "Qwen 2.5 7B\nINT4 4.3 GB\nPort 5561" as LLM
-    participant "Kokoro v1.0\nINT8 0.1 GB\nPort 5565" as TTS
-    participant "FLUX.1-schnell\nINT8 4.5 GB (on-demand)\nPort 5568" as IMGGEN
+box "Audio / Language Nodes" #E3F2FD
+    participant "STT\nWhisper V3 INT8\n1.5 GB · Port 5563" as STT
+    participant "LLM\nQwen 2.5 7B INT4\n4.3 GB · Port 5561" as LLM
+    participant "TTS\nKokoro v1.0 INT8\n0.1 GB · Port 5565" as TTS
+end box
+
+box "Enhancement Nodes (On-Demand)" #E8EAF6
+    participant "Video Denoise\nBasicVSR++ FP16\n1.5 GB · Port 5568" as VDN
+    participant "Audio Denoise\nDTLN FP32\n0.05 GB · Port 5569" as ADN
 end box
 
 box "Frontend" #F3E5F5
-    participant "uWebSockets\nC++ :9001 · ZMQ Port 5570\n/video /audio /chat" as UWS
-    participant "Browser JS\nCanvas+AudioCtx" as UI
+    participant "WS Bridge\nuWebSockets :9001\nPort 5570" as UWS
+    participant "Browser\nCanvas + AudioCtx" as UI
 end box
 
 box "Daemon" #EFEBE9
-    participant "OmniEdgeDaemon\nWatchdog · ZMQ Port 5571" as DAEMON
+    participant "OmniEdgeDaemon\nWatchdog · Port 5571" as DAEMON
 end box
+
+
+note over DAEMON, UWS
+  All modules use **MessageRouter**
+  (common/networking/message_router.hpp)
+  for consolidated ZMQ PUB/SUB management.
+  One MessageRouter per process replaces
+  manual ZMQ context, sockets, and poll loop.
+end note
 
 
 ' ==============================================================
 ' PHASE 1 — SYSTEM BOOT
 ' ==============================================================
 
-== Phase 1: System Boot ==
+== Phase 1: System Boot — Daemon Spawns All Processes ==
 
 note over DAEMON
-  oe_daemon is the **only** binary the user starts.
-  It spawns every microservice via posix_spawn().
+  **oe_daemon** is the only binary the user starts.
+  Reads omniedge_config.yaml, probes GPU via NVML,
+  selects tier (minimal/balanced/standard/ultra),
+  then spawns each module via posix_spawn().
   Each child = independent ELF binary with own main().
-  IPC boundary: ZMQ sockets + POSIX shm only.
+  **Each process creates its own CUDA context
+  via cudaSetDevice(0). No MPS, no CUDA IPC.
+  WDDM time-slices contexts on the GPU.**
 end note
 
-DAEMON -> GSV : posix_spawn("oe_video_ingest")\nZMQ_PUB_PORT=5555
-DAEMON -> GSA : posix_spawn("oe_audio_ingest")\nZMQ_PUB_PORT=5556
-DAEMON -> FR : posix_spawn("oe_face_recog")\nZMQ_PUB_PORT=5566
-DAEMON -> BB : posix_spawn("oe_bg_blur")\nZMQ_PUB_PORT=5567
-DAEMON -> STT : posix_spawn("oe_stt")\nZMQ_PUB_PORT=5563
-DAEMON -> TTS : posix_spawn("oe_tts")\nZMQ_PUB_PORT=5565
-DAEMON -> VLM : posix_spawn("oe_vlm")\nZMQ_PUB_PORT=5562
-DAEMON -> LLM : posix_spawn("oe_llm")\nZMQ_PUB_PORT=5561
-DAEMON -> UWS : posix_spawn("oe_ws_bridge")\nHTTP_PORT=9001
+DAEMON -> UWS : posix_spawn("oe_ws_bridge")
+note right: Launched FIRST — relays module_ready events
+
+DAEMON -> GSV : posix_spawn("oe_video_ingest")
+DAEMON -> GSA : posix_spawn("oe_audio_ingest")
+DAEMON -> BB  : posix_spawn("oe_bg_blur")
+DAEMON -> FR  : posix_spawn("oe_face_recog")
+DAEMON -> STT : posix_spawn("oe_stt")
+DAEMON -> TTS : posix_spawn("oe_tts")
+DAEMON -> LLM : posix_spawn("oe_llm")
 
 note over DAEMON
-  All children report HEALTHY on heartbeat
-  sockets before daemon enters watchdog loop.
-  Boot target: < 8 seconds.
-  Daemon loads omniedge_config.yaml at startup
-  and maintains a conversation state machine (7 states):
-  IDLE → LISTENING → PROCESSING → SPEAKING
-  PROCESSING_VISION (VLM on-demand)
-  INTERRUPTED (barge-in) → LISTENING
-  ERROR_RECOVERY (module crash → restart)
-  (see Conversation Orchestration section).
+  Each module initializes → loads TRT/ONNX engine
+  → MessageRouter binds PUB → publishes module_ready.
+  Daemon waits 30 s per module, proceeds without
+  stragglers. Then enters watchdog + state machine loop.
+  **7-state FSM:** IDLE · LISTENING · PROCESSING ·
+  PROCESSING_VISION · SPEAKING · INTERRUPTED · ERROR_RECOVERY
 end note
 
 
 ' ==============================================================
-' PHASE 2 — BROWSER CONNECTS (JS initiates everything)
+' PHASE 2 — BROWSER CONNECTS
 ' ==============================================================
 
-== Phase 2: Browser Opens — 3 WebSocket Channels ==
+== Phase 2: Browser Connects — 5 WebSocket Channels ==
 
-UI -> UI : window.onload fires
-
-note over UI
-  **JS connection setup:**
-  const wsVideo = new WebSocket("ws://localhost:9001/video");
-  const wsAudio = new WebSocket("ws://localhost:9001/audio");
-  const wsChat  = new WebSocket("ws://localhost:9001/chat");
-  wsVideo.binaryType = "arraybuffer";
-  wsAudio.binaryType = "arraybuffer";
-end note
-
-UI -> UWS : WebSocket("ws://localhost:9001/video")
-UWS -> UWS : ws<VideoCtx>("/video",\n{.open=[](ws){clients_video.push_back(ws);}})
-
-UI -> UWS : WebSocket("ws://localhost:9001/audio")
-UWS -> UWS : ws<AudioCtx>("/audio",\n{.open=[](ws){clients_audio.push_back(ws);}})
-
-UI -> UWS : WebSocket("ws://localhost:9001/chat")
-UWS -> UWS : ws<ChatCtx>("/chat",\n{.open=[](ws){clients_chat.push_back(ws);}})
+UI -> UWS : new WebSocket("/video")   [binary JPEG]
+UI -> UWS : new WebSocket("/audio")   [binary PCM]
+UI -> UWS : new WebSocket("/chat")    [bidirectional JSON]
+UI -> UWS : new WebSocket("/denoise_video")   [binary JPEG, denoised]
+UI -> UWS : new WebSocket("/denoise_audio")   [binary PCM, denoised]
 
 note over UWS
-  **C++ bridge threading model:**
+  **C++ bridge threading:**
   Thread 1: uWS event loop (WebSocket I/O)
-  Thread 2: zmq_poll() on all SUB sockets
-  Data passed via thread-safe queue +
-  uWS::Loop::defer() to avoid lock contention.
+  Thread 2: MessageRouter::run() polls all SUB sockets
+  Data bridged via queue + uWS::Loop::defer()
+
+  **/denoise_video** and **/denoise_audio** are idle
+  until the user toggles enhancement from the UI.
+  The daemon spawns BasicVSR++ / DTLN on demand.
 end note
 
 
@@ -126,175 +129,104 @@ end note
 ' PHASE 3 — VIDEO PIPELINE
 ' ==============================================================
 
-== Phase 3: Video — Webcam -> GPU -> JPEG -> Canvas ==
-
-note over GSV
-  **Input:** Webcam H.264 over TCP :5000
-  from Windows host (ksvideosrc x264enc
-  tune=zerolatency bitrate=16000000)
-end note
+== Phase 3: Video — Webcam → GPU → JPEG → Canvas ==
 
 group Video Ingest [oe_video_ingest]
-    GSV -> GSV : GStreamer pipeline:\ntcpclientsrc → H.264 decode\n→ BGR24 conversion → appsink
-    GSV -> GSV : appsink callback fires:\nextract GstBuffer, map memory
-    GSV -> GSV : Write 6.2 MB BGR frame to\n/oe.vid.ingest (double-buffer slot)\nincrement sequence_number + timestamp
+    GSV -> GSV : GStreamer:\nv4l2src → jpegdec → videoconvert → BGR appsink
+    GSV -> GSV : Write 6.2 MB BGR to /oe.vid.ingest\n(double-buffer, atomic writeIndex flip)
     GSV -> ZMQ : PUB "video_frame"\n{shm:"/oe.vid.ingest", seq:N}
 end
 
 note over ZMQ
-  **ZMQ_CONFLATE=1** on data-plane topics only:
+  **ZMQ_CONFLATE=1** on data topics:
   video_frame, audio_chunk, blurred_frame, identity.
-  Control topics (llm_prompt, transcription, etc.)
-  use ZMQ_CONFLATE=0 (queue all, in-order).
+  **ZMQ_CONFLATE=0** on control topics:
+  llm_prompt, transcription, ui_command, llm_response.
 end note
 
-group Face Recognition [oe_face_recog — InspireFace]
-    ZMQ -> FR : SUB "video_frame"\ntcp://localhost:5555
-    FR -> FR : **shm read /oe.vid.ingest**\nmemcpy(pinned_buf, shm_ptr, frame_size)
-    note right of FR
-      cudaHostRegister unsupported on WSL2.
-      Must use cudaHostAlloc staging buffer.
-    end note
-    FR -> FR : cudaMemcpyAsync(d_input,\npinned_buf, size, H2D, stream)
-    FR -> FR : HF_FaceDetect -> vector<FaceRect>\nHF_FaceAlign -> aligned_chip\nHF_FaceFeatureExtract -> float[512]\nHF_FaceComparison(emb, gallery)\n-> {name, confidence}
+group Face Recognition [oe_face_recog]
+    ZMQ -> FR : SUB "video_frame" (5555)\n(every 3rd frame ~10 fps)
+    FR -> FR : readLatestBgrFrame(shmIn_)\n→ BgrFrameView{data, w, h, slot}
+    FR -> FR : backend_->detect(frame)\n→ bbox + 512-dim embedding
+    FR -> FR : cosine sim vs SQLite gallery\n→ {name, confidence}
     FR -> ZMQ : PUB "identity"\n{name:"Admin", conf:0.98}
 end
 
-group Background Blur [oe_bg_blur — YOLOv8-seg + adjust + shapes]
-    ZMQ -> BB : SUB "video_frame"\ntcp://localhost:5555
-    ZMQ -> BB : SUB "ui_command"\ntcp://localhost:5570\n(set_image_adjust, update_shapes)
-    BB -> BB : **shm read /oe.vid.ingest**\ncudaMemcpyAsync via pinned buf
-    BB -> BB : enqueueV2({d_input, d_mask})\n// YOLOv8-seg [1,3,640,640] FP16
-    BB -> BB : cudaStreamSynchronize(stream)\ncv::cuda::resize(mask, {1920,1080})
-    BB -> BB : cv::cuda::GaussianBlur(frame,\nblurred, {51,51}, 25.0, stream)
-    BB -> BB : Composite: out[i] =\nmask[i] ? sharp[i] : blurred[i]
-    BB -> BB : applyImageAdjustments(bright,\ncontrast, sat, sharp) // CUDA
-    BB -> BB : renderShapes(shapes, mask)\n// CPU draw + mask-aware composite
-    BB -> BB : nvjpegEncode(output, quality=85)\n-> jpeg_buf, jpeg_size
-    BB -> BB : **shm write /oe.cv.blur.jpeg**\nmemcpy(shm_ptr, jpeg_buf, jpeg_size)
+group Background Blur [oe_bg_blur — 5-step GPU pipeline]
+    ZMQ -> BB : SUB "video_frame" (5555)
+    ZMQ -> BB : SUB "ui_command" (5570)\n(set_image_adjust, update_shapes)
+    BB -> BB : 1. Read BGR from SHM
+    BB -> BB : 2. ISP: BCS + sharpen (GPU)
+    BB -> BB : 3. YOLOv8-seg → person mask
+    BB -> BB : 4. Gaussian blur compositing
+    BB -> BB : 5. nvJPEG encode → /oe.cv.blur.jpeg
     BB -> ZMQ : PUB "blurred_frame"\n{shm:"/oe.cv.blur.jpeg", size:N}
 end
 
-group VLM Scene Description [oe_vlm — Moondream2]
-    ZMQ -> VLM : SUB "video_frame"\ntcp://localhost:5555
-    note right of VLM
-      Periodic (every 5 s) or on-demand
-      via "describe_scene" UI command.
-      Drops frames via ZMQ_CONFLATE.
-    end note
-    VLM -> VLM : **shm read /oe.vid.ingest**\ncv::resize(frame, {378,378})\nnormalize, cudaMemcpyAsync
-    VLM -> VLM : SigLIP encoder:\nimage_features = encoder->enqueueV2()\n// [1, 729, 2048] feature tensor
-    VLM -> VLM : Text decoder loop:\nfor (i=0; i<max_tokens; i++) {\n  logits = decoder->enqueueV2(\n    {image_features, token_ids})\n  tok = argmax(logits)\n  if (tok==EOS) break;\n}
-    VLM -> VLM : detokenize(token_ids) -> description
-    VLM -> ZMQ : PUB "vlm_description"\n{text:"A person at a desk..."}
+group VLM [oe_vlm — on-demand or periodic]
+    ZMQ -> VLM : SUB "video_frame" (5555)
+    VLM -> VLM : SigLIP encode (378×378)\n→ [1, 729, 2048] features
+    VLM -> VLM : Text decoder loop → description
+    VLM -> ZMQ : PUB "vlm_description"\n{text:"Person at desk..."}
 end
 
-note over UWS
-  **Bridge receives blurred_frame:**
-  zmq_poll -> read JPEG from shm
-  -> uWS::Loop::defer([&]{
-    for (ws : clients_video)
-      ws->send({jpeg, size}, BINARY);
-  })
-end note
-
-ZMQ -> UWS : SUB "blurred_frame" (port 5567)
-UWS -> UWS : shm read /oe.cv.blur.jpeg
-UWS -> UI : ws.send(jpeg_bytes, {binary:true})\n// /video ~30 fps
-
-note over UI
-  **JS video rendering:**
-  wsVideo.onmessage = (event) => {
-    const blob = new Blob(
-      [event.data], {type:"image/jpeg"});
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      ctx.drawImage(img, 0, 0,
-        canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
-  };
-end note
+ZMQ -> UWS : SUB "blurred_frame" (5567)\nSUB "video_frame" (5555) [raw fallback]
+UWS -> UI : /video: binary JPEG @ 30 fps\n→ Blob → canvas.drawImage()
 
 
 ' ==============================================================
 ' PHASE 4 — AUDIO PIPELINE
 ' ==============================================================
 
-== Phase 4: Audio — Mic -> STT -> LLM -> TTS -> Speaker ==
+== Phase 4: Audio — Mic → VAD → STT → Daemon ==
 
-note over GSA
-  **Input:** Microphone PCM F32 over TCP :5001
-  from Windows host (wasapi2src 16 kHz mono)
-end note
-
-group Audio Ingest [oe_audio_ingest + Silero VAD]
-    GSA -> GSA : GstPipeline: tcpclientsrc\n-> audioconvert -> audioresample\n-> appsink (F32LE, rate=16000)
-    GSA -> GSA : **Silero VAD filter (CPU, <1ms):**\nspeech_prob = vad_session.Run(chunk)\nif (speech_prob < 0.5) discard;
-    note right of GSA
-      VAD gates every audio chunk.
-      Prevents Whisper hallucinations on
-      silence/noise. Only speech reaches shm.
-      Silero VAD: ~1 MB ONNX, CPU only, 0 VRAM.
-    end note
-    GSA -> GSA : **shm write /oe.aud.ingest**\nmemcpy(shm_ptr, pcm_f32, samples*4)
+group Audio Ingest + VAD [oe_audio_ingest]
+    GSA -> GSA : GStreamer:\ntcpclientsrc :5001 → F32LE 16kHz mono
+    GSA -> GSA : Silero VAD (CPU, <1 ms):\nspeech_prob > 0.5 → pass\nsilence → discard
+    GSA -> GSA : Write PCM to /oe.aud.ingest
     GSA -> ZMQ : PUB "audio_chunk"\n{shm:"/oe.aud.ingest", vad:"speech"}
-    GSA -> ZMQ : (on 1.5s silence after speech)\nPUB "vad_status"\n{speaking:false, silence_ms:1500}
+    GSA -> ZMQ : (on 800 ms silence)\nPUB "vad_status" {speaking:false}
 end
 
 group STT [oe_stt — Whisper V3 Turbo]
-    ZMQ -> STT : SUB "audio_chunk"\ntcp://localhost:5556
-    STT -> STT : **shm read /oe.aud.ingest**\nring_buffer.append(pcm_chunk)\n// 30 s sliding window, 1 s overlap
-    STT -> STT : 128-bin Log-Mel spectrogram:\nfor each 25ms window (10ms hop):\n  fft = rfft(window * hann)\n  mel = filterbank @ |fft|^2\n  log_mel = log(max(mel, 1e-10))
-    STT -> STT : cudaMemcpyAsync(d_mel, log_mel)\nencoder->enqueueV2({d_mel, d_hidden})\n// mel -> encoder hidden states
-    STT -> STT : Decoder loop:\nwhile (!eos && n < 448) {\n  logits = decoder->enqueueV2(\n    {d_hidden, d_token_ids})\n  tok = argmax(logits[-1])\n  tokens.push_back(tok)\n}
-    STT -> STT : text = tokenizer.decode(tokens)\nlang = detect_language(logits[0])
+    ZMQ -> STT : SUB "audio_chunk" (5556)
+    STT -> STT : Read PCM from SHM\n→ 128-bin Log-Mel spectrogram (CPU)
+    STT -> STT : cudaMemcpyAsync → encoder → decoder
+    STT -> STT : Hallucination filter:\nno_speech_prob > 0.6 → discard\nrepeat ≥ 3× → suppress
     STT -> ZMQ : PUB "transcription"\n{text:"Hello OmniEdge", lang:"en"}
 end
 
 
 ' ==============================================================
-' PHASE 5 — LLM REASONING
+' PHASE 5 — DAEMON ORCHESTRATION → LLM
 ' ==============================================================
 
-== Phase 5: Daemon Orchestration — Fuses All Inputs → LLM ==
+== Phase 5: Daemon Orchestration — Prompt Assembly → LLM ==
 
 note over DAEMON
-  **OmniEdgeDaemon subscribes to ALL sensor outputs.**
-  It caches latest identity + scene description.
+  Daemon subscribes to ALL sensor outputs.
+  Caches: latest identity, scene description.
   On new transcription → assembles full prompt
-  → publishes "llm_prompt" on port 5571.
-  QwenLLM subscribes ONLY to daemon (port 5571).
+  → publishes "llm_prompt" to LLM.
+  **LLM subscribes ONLY to daemon (port 5571).**
 end note
 
-group Daemon Prompt Assembly [oe_daemon — State Machine]
-    ZMQ -> DAEMON : SUB "transcription" (port 5563)
-    ZMQ -> DAEMON : SUB "identity" (port 5566)
-    ZMQ -> DAEMON : SUB "vlm_description" (port 5562)
-    ZMQ -> DAEMON : SUB "vad_status" (port 5556)
-    ZMQ -> DAEMON : SUB "ui_command" (port 5570)\n(push_to_talk, text_input,\ndescribe_scene, cancel_generation)
+group Prompt Assembly [oe_daemon — FSM]
+    ZMQ -> DAEMON : SUB "transcription" (5563)
+    ZMQ -> DAEMON : SUB "identity" (5566)
+    ZMQ -> DAEMON : SUB "vlm_description" (5562)
+    ZMQ -> DAEMON : SUB "vad_status" (5556)
+    ZMQ -> DAEMON : SUB "ui_command" (5570)
 
-    DAEMON -> DAEMON : State: LISTENING → PROCESSING\nassemble prompt from cached context:\nsystem (200 tok) + face identity (20 tok)\n+ scene (80 tok) + history (2796 tok)\n+ user utterance (500 tok)
-    DAEMON -> ZMQ : PUB "llm_prompt" (port 5571)\n{v:1, system:"...", user:"...",\nidentity:"Admin", scene:"...",\nhistory:[...]}
+    DAEMON -> DAEMON : LISTENING → PROCESSING\nAssemble prompt: system (200 tok)\n+ identity (20) + scene (80)\n+ history (2796) + utterance (500)\n= 4096 token budget
+    DAEMON -> ZMQ : PUB "llm_prompt" (5571)\n{system:..., user:..., identity:...,\nscene:..., history:[...]}
 end
 
-group LLM [oe_llm — Qwen 2.5 7B]
-    ZMQ -> LLM : SUB "llm_prompt" (port 5571)\n// ONLY subscribes to daemon
-
-    note over LLM
-      **LLM receives fully assembled prompt**
-      from daemon (port 5571). It does NOT
-      subscribe to raw sensor topics.
-      KV cache: 1.15 GB (FP8 on Blackwell SM10.0+)
-      Max context: 4096 tokens (standard tier)
-    end note
-
-    LLM -> LLM : prompt = parseLlmPrompt(msg)\ntoken_ids = encode(prompt)\nassert(len <= max_seq_len)
-    LLM -> LLM : **TRT-LLM GptSession:**\nsession.setup(batch=1, max_new=512)\nwhile (!finished) {\n  session.step(d_logits)\n  tok = top_p_sample(\n    d_logits, temp=0.7, p=0.9)\n  if (tok==eos) finished=true;
-    LLM -> ZMQ : PUB "llm_response" (streamed)\n{token:"Hello", finished:false}\n// ~40 tok/s on RTX PRO 3000 (12 GB)
-    LLM -> ZMQ : PUB "llm_response"\n{token:"", finished:true}
+group LLM [oe_llm — Qwen 2.5 7B INT4-AWQ]
+    ZMQ -> LLM : SUB "llm_prompt" (5571)
+    LLM -> LLM : Tokenize → TRT-LLM GptSession\npaged KV cache (1.15 GB budget)\ntop-p=0.9, temp=0.7
+    LLM -> ZMQ : PUB "llm_response" (streamed)\n{token:"Hello", finished:false}
+    LLM -> ZMQ : {token:"", finished:true}
 end
 
 
@@ -302,273 +234,198 @@ end
 ' PHASE 6 — TTS
 ' ==============================================================
 
-== Phase 6: TTS — LLM Tokens -> Audio -> Browser ==
+== Phase 6: TTS — Sentence Streaming → Browser Audio ==
 
-group TTS [oe_tts — Kokoro v1.0]
-    ZMQ -> TTS : SUB "llm_response" (port 5561)
-    TTS -> TTS : **Sentence accumulation:**\nbuf += tok; if (buf.ends_with('.')\n|| buf.ends_with('?') || finished)\n  sentence = buf; buf.clear();
-    TTS -> TTS : **espeak-ng G2P:**\nipa = espeak_text_to_phonemes(\n  sentence, "en", IPA)\nids = phoneme_to_id_map(ipa)
-    TTS -> TTS : **ONNX Runtime inference:**\ninput_ids = CreateTensor(ids)\nstyle = load_npy("af_heart.npy")\noutput = session.Run({ids, style})\npcm = output[0].GetTensorData<float>()
-    TTS -> TTS : **shm write /oe.aud.tts**\nmemcpy(shm, pcm, samples*4)\nheader->sample_rate = 24000
+group TTS [oe_tts — Kokoro v1.0 INT8]
+    ZMQ -> TTS : SUB "llm_response" (5561)
+    TTS -> TTS : Accumulate tokens → sentence\n(split on . ? ! or finished)
+    TTS -> TTS : espeak-ng G2P → phoneme IDs\nONNX Runtime → PCM F32 @ 24 kHz
+    TTS -> TTS : Write PCM to /oe.aud.tts
     TTS -> ZMQ : PUB "tts_audio"\n{shm:"/oe.aud.tts", rate:24000}
 end
 
-note over UWS
-  **Bridge receives tts_audio:**
-  zmq_poll -> shm read /oe.aud.tts
-  -> convert float32 -> int16
-  -> defer send to /audio clients
-end note
+ZMQ -> UWS : SUB "tts_audio" (5565)
+UWS -> UI : /audio: binary PCM\n→ AudioContext @ 24 kHz
 
-ZMQ -> UWS : SUB "tts_audio" (port 5565)
-UWS -> UWS : shm read /oe.aud.tts\nfloat32 -> int16 conversion
-UWS -> UI : ws.send(pcm_int16, {binary:true})\n// /audio channel
+
+' ==============================================================
+' PHASE 7 — CHAT STREAMING
+' ==============================================================
+
+== Phase 7: Chat — Streamed Tokens → Browser ==
+
+ZMQ -> UWS : SUB "llm_response" (5561)
+UWS -> UI : /chat: JSON {token, finished}\n→ append to chat bubble
+
+
+' ==============================================================
+' PHASE 8 — USER ACTIONS
+' ==============================================================
+
+== Phase 8: User Actions — Browser → Backend ==
 
 note over UI
-  **JS audio playback:**
-  const audioCtx = new AudioContext(
-    {sampleRate: 24000});
-  let audioQueue = [], isPlaying = false;
-
-  wsAudio.onmessage = (event) => {
-    const pcm16 = new Int16Array(event.data);
-    const f32 = new Float32Array(pcm16.length);
-    for (let i=0; i<pcm16.length; i++)
-      f32[i] = pcm16[i] / 32768.0;
-    const buf = audioCtx.createBuffer(
-      1, f32.length, 24000);
-    buf.getChannelData(0).set(f32);
-    audioQueue.push(buf);
-    if (!isPlaying) playNext();
-  };
-
-  function playNext() {
-    if (!audioQueue.length)
-      { isPlaying=false; return; }
-    isPlaying = true;
-    const src = audioCtx.createBufferSource();
-    src.buffer = audioQueue.shift();
-    src.connect(audioCtx.destination);
-    src.onended = playNext;
-    src.start();
-  }
+  All UI interactions follow one pattern:
+  JS event → WebSocket JSON → uWS parse
+  → ZMQ PUB "ui_command" → target module
 end note
 
-
-' ==============================================================
-' PHASE 7 — CHAT TOKEN STREAMING
-' ==============================================================
-
-== Phase 7: Chat — Streamed Tokens -> Browser ==
-
-ZMQ -> UWS : SUB "llm_response" (port 5561)
-UWS -> UI : ws.send(JSON.stringify(msg))\n// /chat text frame
-
-note over UI
-  **JS chat rendering:**
-  let bubble = null;
-  wsChat.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (!bubble) {
-      bubble = document.createElement("div");
-      bubble.className = "chat-bubble assistant";
-      chatContainer.appendChild(bubble);
-    }
-    bubble.textContent += msg.token;
-    chatContainer.scrollTop =
-      chatContainer.scrollHeight;
-    if (msg.finished) bubble = null;
-  };
-end note
-
-
-' ==============================================================
-' PHASE 8 — USER-INITIATED ACTIONS (JS -> Backend)
-' ==============================================================
-
-== Phase 8: User Actions — JS Triggers Backend ==
-
-note over UI
-  **All UI interactions follow one pattern:**
-  JS click -> WebSocket JSON -> uWS parse
-  -> ZMQ PUB "ui_command" -> microservice
-end note
-
-' ── Action A: Push-to-Talk ──
-group Push-to-Talk (PTT) #FFEBEE
-    UI -> UI : btn-ptt mousedown:\nwsChat.send(JSON.stringify(\n  {action:"push_to_talk",state:true}));
-    UI -> UWS : /chat text frame\n{action:"push_to_talk", state:true}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> DAEMON : Daemon: state IDLE → LISTENING
-    DAEMON -> GSA : Start audio capture\ngst_element_set_state(PLAYING)
-    note over DAEMON
-      **State machine transitions (7 states, 23 transitions):**
-      PTT press  → IDLE → LISTENING
-      PTT release → LISTENING → PROCESSING
-      VAD 1.5s silence → auto PROCESSING
-      DESCRIBE_SCENE → IDLE → PROCESSING_VISION
-      Barge-in (PTT during SPEAKING)
-      → INTERRUPTED → LISTENING
-      MODULE_CRASH → ERROR_RECOVERY → IDLE
-    end note
-    UI -> UI : btn-ptt mouseup:\nwsChat.send({action:\n  "push_to_talk",state:false});
-    UI -> UWS : {action:"push_to_talk",state:false}
-    ZMQ -> DAEMON : Daemon: LISTENING → PROCESSING\nassemble prompt → send to LLM
+' ── Push-to-Talk ──
+group Push-to-Talk #FFEBEE
+    UI -> UWS : {action:"push_to_talk", state:true}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> DAEMON : FSM: IDLE → LISTENING
+    note over DAEMON: Audio capture begins
+    UI -> UWS : {action:"push_to_talk", state:false}
+    ZMQ -> DAEMON : FSM: LISTENING → PROCESSING\n→ prompt assembly → LLM
 end
 
-' ── Action B: Disable Webcam ──
-group Disable Webcam #E3F2FD
-    UI -> UI : btn-webcam click:\nwsChat.send({action:\n  "disable_webcam", state:true})
-    UI -> UWS : {action:"disable_webcam", state:true}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> GSV : gst_element_set_state(\n  pipeline, GST_STATE_PAUSED)\n// FR,BB,VLM starve. Canvas frozen.
+' ── Text Input ──
+group Text Input #E8F5E9
+    UI -> UWS : {action:"text_input", text:"..."}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> DAEMON : Bypass STT: IDLE → PROCESSING\nassemblePrompt(text) → LLM
 end
 
-' ── Action C: Text Chat (bypass STT) ──
-group Text Chat Input #E8F5E9
-    UI -> UI : chatInput "Enter" handler:\nconst text = chatInput.value.trim();\nappendBubble("user", text);\nwsChat.send({action:\n  "text_input", text: text});
-    UI -> UWS : {action:"text_input",\ntext:"What do you see?"}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)\n{action:"text_input",\ntext:"What do you see?"}
-    note over DAEMON
-      text_input bypasses STT entirely.
-      Daemon receives it as a ui_command,
-      assembles prompt identically to a
-      PTT transcription, and publishes
-      llm_prompt on port 5571.
-    end note
-    ZMQ -> DAEMON : SUB "ui_command"\n-> TEXT_INPUT event
-    DAEMON -> DAEMON : assemblePrompt(text)\nstate: IDLE → PROCESSING
-    DAEMON -> ZMQ : PUB "llm_prompt" (port 5571)\n{system:"...", user:"What do you see?",\nhistory:[...]}
-    ZMQ -> LLM : SUB "llm_prompt" (port 5571)\n-> triggers Phase 5 LLM inference
-    LLM -> ZMQ : PUB "llm_response" (stream)
-    ZMQ -> UWS : -> Phase 7 chat rendering
-    ZMQ -> TTS : -> Phase 6 TTS synthesis
-end
-
-' ── Action D: Register Face ──
-group Register Face #F3E5F5
-    UI -> UI : btn-register-face click:\nOpen file picker OR capture webcam snapshot
-    UI -> UWS : /chat binary frame\n{action:"register_face",\nname:"Admin", image: <JPEG bytes>}
-    UWS -> UWS : Decode JPEG → BGR buffer\nWrite to temp shm /oe.vid.register
-    UWS -> ZMQ : PUB "ui_command" (port 5570)\n{action:"register_face",\nname:"Admin", shm:"/oe.vid.register"}
-    ZMQ -> FR : SUB "ui_command"\nRead BGR from /oe.vid.register
-    FR -> FR : HF_FaceDetect → crop face\nHF_FaceAlign → aligned chip\nHF_FaceFeatureExtract → float[512]
-    FR -> FR : INSERT INTO known_faces\n(name, embedding) VALUES (...)
-    FR -> ZMQ : PUB "face_registered"\n{name:"Admin", success:true}
-    ZMQ -> UWS : SUB "face_registered" (port 5566)
-    UWS -> UI : /chat JSON\n{type:"face_registered",\nname:"Admin", success:true}
-    note over UI
-      showToast("Face registered: Admin");
-      // Future frames will identify
-      // this person by name.
-    end note
-end
-
-' ── Action E: Describe Scene ──
+' ── Describe Scene ──
 group Describe Scene #FFF3E0
-    UI -> UI : btn-describe click:\nwsChat.send(\n  {action:"describe_scene"})
     UI -> UWS : {action:"describe_scene"}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> VLM : SUB "ui_command"\nforce_inference_now = true\n// Run Moondream2 immediately
-    VLM -> ZMQ : PUB "vlm_description"\n{text:"Person at desk,\ntwo monitors, coffee mug."}
-    ZMQ -> UWS : SUB "vlm_description" (5562)
-    UWS -> UI : /chat JSON\n{type:"vlm", text:description}
-    note over UI
-      if (msg.type === "vlm")
-        appendBubble("system",
-          "Scene: " + msg.text);
-    end note
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> VLM : force immediate inference
+    VLM -> ZMQ : PUB "vlm_description"
+    ZMQ -> UWS : relay to browser
+    UWS -> UI : {type:"vlm", text:"..."}
 end
 
-' ── Action F: Image Adjustments ──
+' ── Register Face ──
+group Register Face #F3E5F5
+    UI -> UWS : {action:"register_face",\nname:"Admin", image:<JPEG>}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> FR : detect → align → embed\n→ INSERT INTO known_faces
+    FR -> ZMQ : PUB "face_registered"\n{name:"Admin", success:true}
+    ZMQ -> UWS : relay confirmation
+    UWS -> UI : showToast("Face registered")
+end
+
+' ── Image Adjustments ──
 group Image Adjustments #E0F7FA
-    UI -> UI : Slider change (debounced 10/s):\nwsChat.send({action:\n  "set_image_adjust", adjust:{\n  brightness:0.2, contrast:1.1,\n  saturation:1.3, sharpness:1.5}})
-    UI -> UWS : {action:"set_image_adjust",\nadjust:{brightness:0.2,...}}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> BB : SUB "ui_command"\ncache ImageAdjust struct atomically\n// Applied per-frame in GPU pipeline
-    note over BB
-      If all values are defaults
-      (0.0, 1.0, 1.0, 0.0), the
-      adjustment pipeline is skipped
-      entirely — zero overhead.
-    end note
+    UI -> UWS : {action:"set_image_adjust",\nadjust:{brightness, contrast,\nsaturation, sharpness}}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> BB : Update ISP params atomically\n(skipped if all defaults)
 end
 
-' ── Action G: Shape Overlays ──
-group Shape Overlays #E0F2F1
-    UI -> UI : Canvas pointerup:\nshapeList.push(newShape);\nwsChat.send({action:\n  "update_shapes",\n  shapes: shapeList})
-    UI -> UWS : {action:"update_shapes",\nshapes:[{type:"rect",...},...]}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> BB : SUB "ui_command"\nstore shape list, render onto\nblurred background region only\n// Foreground mask pixels untouched
-end
-
-' ── Action H: Barge-In (PTT during SPEAKING) ──
+' ── Barge-In ──
 group Barge-In Interruption #FFCDD2
-    note over DAEMON
-      User presses PTT while assistant
-      is speaking. Daemon interrupts all
-      active generation within 100 ms.
-    end note
-    UI -> UWS : {action:"push_to_talk",\nstate:true}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> DAEMON : state: SPEAKING → INTERRUPTED
-    DAEMON -> ZMQ : PUB "ui_command"\n{action:"cancel_generation"}\n→ LLM stops emitting tokens
-    DAEMON -> ZMQ : PUB "ui_command"\n{action:"flush_tts"}\n→ TTS clears pending sentences
-    DAEMON -> ZMQ : PUB "ui_command"\n{action:"stop_playback"}\n→ Frontend stops audio playback
-    ZMQ -> LLM : cancel_generation received\nstop token loop immediately
-    ZMQ -> TTS : flush_tts received\nclear sentence queue
-    ZMQ -> UWS : stop_playback received
-    UWS -> UI : {type:"stop_playback"}\naudioQueue = []; isPlaying = false;
-    DAEMON -> DAEMON : state: INTERRUPTED → LISTENING\nstart audio capture pipeline
+    note over DAEMON: PTT during SPEAKING state
+    UI -> UWS : {action:"push_to_talk", state:true}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> DAEMON : SPEAKING → INTERRUPTED
+    DAEMON -> ZMQ : cancel_generation → LLM\nflush_tts → TTS\nstop_playback → Browser
+    ZMQ -> LLM : stop token loop
+    ZMQ -> TTS : clear sentence queue
+    ZMQ -> UWS : stop_playback
+    UWS -> UI : audioQueue=[]; reset AudioCtx
+    DAEMON -> DAEMON : INTERRUPTED → LISTENING
 end
 
 
 ' ==============================================================
-' PHASE 9 — WATCHDOG & HEARTBEAT
+' PHASE 8b — VIDEO/AUDIO DENOISING (ON-DEMAND)
+' ==============================================================
+
+== Phase 8b: Video/Audio Denoising (On-Demand) ==
+
+note over VDN, ADN
+  Enhancement modules are **not loaded at boot**.
+  Daemon spawns them on-demand when the user
+  toggles denoising from the web UI.
+  Eviction priority 0 (evicted first).
+end note
+
+' ── Toggle Video Denoise ──
+group Video Denoise Toggle #E8EAF6
+    UI -> UWS : {action:"toggle_video_denoise", enabled:true}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> DAEMON : handleOnDemandRequest("video_denoise")
+    DAEMON -> DAEMON : probeGpu(0).freeMb ≥ 1500?\nYES → spawn | NO → evict lowest priority
+    DAEMON -> VDN : posix_spawn("oe_video_denoise")
+    VDN -> ZMQ : PUB "module_ready"
+end
+
+group Video Denoise Pipeline [oe_video_denoise]
+    ZMQ -> VDN : SUB "video_frame" (5555)
+    VDN -> VDN : Read BGR from /oe.vid.ingest SHM\n→ 5-frame temporal ring buffer
+    VDN -> VDN : BasicVSR++ ONNX inference\n(bidirectional propagation,\nflow-guided deformable alignment)
+    VDN -> VDN : nvJPEG encode → /oe.vid.denoise SHM
+    VDN -> ZMQ : PUB "denoised_frame"\n{shm:"/oe.vid.denoise", size:N}
+end
+
+ZMQ -> UWS : SUB "denoised_frame" (5568)
+UWS -> UI : /denoise_video: binary JPEG\n→ Blob → second canvas (split-screen)
+
+' ── Toggle Audio Denoise ──
+group Audio Denoise Toggle #E8EAF6
+    UI -> UWS : {action:"toggle_audio_denoise", enabled:true}
+    UWS -> ZMQ : PUB "ui_command" (5570)
+    ZMQ -> DAEMON : handleOnDemandRequest("audio_denoise")
+    DAEMON -> ADN : posix_spawn("oe_audio_denoise")
+    ADN -> ZMQ : PUB "module_ready"
+end
+
+group Audio Denoise Pipeline [oe_audio_denoise]
+    ZMQ -> ADN : SUB "audio_chunk" (5556)
+    ADN -> ADN : Read PCM from /oe.aud.ingest SHM
+    ADN -> ADN : DTLN Stage 1: separation network\n(STFT magnitude domain, LSTM)
+    ADN -> ADN : DTLN Stage 2: signal reconstruction\n(complex spectrum domain, LSTM)
+    ADN -> ADN : Write PCM to /oe.aud.denoise SHM
+    ADN -> ZMQ : PUB "denoised_audio"\n{shm:"/oe.aud.denoise", samples:N}
+end
+
+ZMQ -> UWS : SUB "denoised_audio" (5569)
+UWS -> UI : /denoise_audio: binary PCM\n→ AudioContext A/B comparison
+
+
+' ==============================================================
+' PHASE 9 — WATCHDOG & FAULT TOLERANCE
 ' ==============================================================
 
 == Phase 9: Watchdog — Heartbeat & Auto-Recovery ==
 
 note over DAEMON
-  **ZMTP protocol-level PING/PONG:**
-  Runs inside ZMQ I/O thread — works even
-  if module's main thread is in a CUDA kernel.
-  ZMQ_HEARTBEAT_IVL    = 1000 ms
-  ZMQ_HEARTBEAT_TIMEOUT = 5000 ms
-  ZMQ_HEARTBEAT_TTL     = 10000 ms
+  **ZMTP PING/PONG** (runs in ZMQ I/O thread —
+  works even during CUDA kernel execution):
+  ZMQ_HEARTBEAT_IVL      = 1000 ms
+  ZMQ_HEARTBEAT_TIMEOUT  = 5000 ms
+  ZMQ_HEARTBEAT_TTL      = 10000 ms
 end note
 
-loop Every 1000 ms (ZMTP automatic — all 9 modules)
-    DAEMON --> FR : PING
-    FR --> DAEMON : PONG
+loop Every 1000 ms (ZMTP automatic)
+    DAEMON --> FR  : PING
+    FR     --> DAEMON : PONG
     DAEMON --> LLM : PING
-    LLM --> DAEMON : PONG
-    note over DAEMON
-      Same PING/PONG for: GSV, GSA, BB,
-      VLM, STT, TTS, UWS (omitted for brevity)
-    end note
+    LLM    --> DAEMON : PONG
+    note over DAEMON: Same for all active modules
 end
 
-' ── Failure Recovery ──
-== Failure: Face Recognition Crashes ==
+== Failure Recovery Example ==
 
-FR ->x FR : SIGSEGV (corrupted TRT engine)
-DAEMON --> FR : PING (no PONG within 5000 ms)
-note over DAEMON : ZMQ_EVENT_DISCONNECTED fires
+FR ->x FR : SIGSEGV (crash)
+DAEMON --> FR : PING — no PONG within 5000 ms
+DAEMON -> DAEMON : kill(pid, SIGTERM)\n→ waitpid (2 s) → SIGKILL if needed\nrestartCount++ (max 3)\nSIGKILL handles stuck CUDA kernels:\ndriver reclaims context + VRAM
+DAEMON -> FR : posix_spawn("oe_face_recog")\nFresh CUDA context → clean VRAM
+DAEMON -> UWS : PUB "module_status"\n{module:"face_recognition", status:"down"}
+UWS -> UI : Graceful degradation:\nLLM prompt: "identity: unknown"
 
-DAEMON -> DAEMON : kill(fr_pid, SIGTERM)\nwaitpid(fr_pid, 2s timeout)\nif (!exited) kill(SIGKILL)\nrestartCount[FR]++\nif (count > 5) {\n  logCritical("FR max restarts");\n  return; // prevent restart loop\n}
-DAEMON -> FR : posix_spawn("oe_face_recog")\n// Fresh VRAM allocation
-
-DAEMON -> UWS : PUB "module_status"\n{module:"face_recognition",status:"down"}
-UWS -> UI : /chat JSON\n{type:"module_status",...}
 note over UI
-  **Graceful degradation (per module):**
-  FR down → LLM: "User: Unknown"
+  **Degradation matrix:**
+  FR down → identity unknown
   Blur down → raw video passthrough
-  STT down → disable PTT, show text input
+  STT down → text input fallback
   TTS down → text-only responses
-  Daemon pushes status via WebSocket.
-  UI adapts in real-time.
+  LLM down → "Restarting…" banner
+  VLM down → Describe Scene disabled
+  Video Denoise down → toggle disabled
+  Audio Denoise down → toggle disabled
 end note
 
 
@@ -580,94 +437,50 @@ end note
 
 note over DAEMON
   **Process-level VRAM isolation:**
-  Each module = separate process with own CUDA context.
-  Process exit → CUDA driver destroys context →
-  ALL VRAM freed as contiguous blocks (zero fragmentation).
-
-  **On-demand pattern (balanced tier):**
-  VLM is not always loaded. When user requests
-  "describe_scene", daemon spawns oe_vlm, waits
-  for result, then SIGTERMs it to free VRAM.
-
-  **Priority-based eviction:**
-  When VRAM is insufficient for a spawn:
-  1. Find lowest-priority IDLE module
-  2. SIGTERM → waitpid → verify VRAM freed
-  3. Spawn requested module
-  Eviction order: Blur(0) → FR(1) → VLM(2) → TTS(3)
-  QwenLLM (priority 5) is NEVER evicted.
+  Process exit → CUDA context destroyed →
+  ALL VRAM freed as contiguous blocks.
+  Zero fragmentation guaranteed.
 end note
 
-group On-Demand VLM Spawn [balanced tier example]
+group On-Demand VLM [balanced tier example]
     UI -> UWS : {action:"describe_scene"}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
+    UWS -> ZMQ : PUB "ui_command" (5570)
     ZMQ -> DAEMON : handleOnDemandRequest("vlm")
-    DAEMON -> DAEMON : probeGpu(0).freeMb >= 2450?\n├ YES → spawn\n└ NO  → evictLowestPriority()
+    DAEMON -> DAEMON : probeGpu(0).freeMb ≥ 2450?\nYES → spawn | NO → evict lowest priority
     DAEMON -> VLM : posix_spawn("oe_vlm")
     VLM -> ZMQ : PUB "module_ready"
-    DAEMON -> DAEMON : wait for "module_ready" (30 s timeout)
-    ZMQ -> VLM : Forward "describe_scene" request
-    VLM -> ZMQ : PUB "vlm_description"\n{text:"Person at desk..."}
-    DAEMON -> VLM : kill(vlm_pid, SIGTERM)\n// VRAM freed: CUDA context destroyed\n// Zero fragmentation — clean as boot
+    ZMQ -> VLM : describe_scene request
+    VLM -> ZMQ : PUB "vlm_description"
+    DAEMON -> VLM : SIGTERM after result\nVRAM freed — zero fragmentation
 end
-
-group On-Demand FLUX Spawn [text_to_image mode]
-    UI -> UWS : {action:"switch_mode",\nmode:"text_to_image"}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> DAEMON : handleModeSwitch("text_to_image")
-    DAEMON -> DAEMON : Evict STT, TTS, VLM, CV\nto free VRAM for FLUX (4.5 GB)
-    DAEMON -> IMGGEN : posix_spawn("oe_img_gen")
-    IMGGEN -> ZMQ : PUB "module_ready"
-    DAEMON -> DAEMON : wait for "module_ready" (30 s timeout)
-    UI -> UWS : {action:"generate_image",\ntext:"A sunset over mountains"}
-    UWS -> ZMQ : PUB "ui_command" (port 5570)
-    ZMQ -> DAEMON : assembleImagePrompt(text)
-    DAEMON -> ZMQ : PUB "image_gen_prompt" (port 5571)
-    ZMQ -> IMGGEN : SUB "image_gen_prompt" (port 5571)
-    IMGGEN -> IMGGEN : CLIP tokenize → 4-step\ndenoising → VAE decode\n→ RGB 512×512 → PNG encode\n→ shm write /oe.nlp.imggen
-    IMGGEN -> ZMQ : PUB "generated_image"\n{shm:"/oe.nlp.imggen", size:N}
-    ZMQ -> UWS : SUB "generated_image" (port 5568)
-    UWS -> UWS : shm read /oe.nlp.imggen
-    UWS -> UI : ws.send(png_bytes, {binary:true})\n// /video channel
-end
-
-note over DAEMON
-  **No in-process loadModel()/unloadModel().**
-  Process isolation guarantees zero CUDA memory
-  fragmentation over millions of load/unload cycles.
-  See vram-management.md for full analysis.
-end note
 
 
 ' ==============================================================
-' VRAM BUDGET
+' VRAM BUDGET NOTE
 ' ==============================================================
 
 note across
   **VRAM Budget — Standard Tier (12 GB)**
-  Qwen 2.5 7B INT4-AWQ ... 4.30 GB  |  InspireFace FP16 ...... ~0.50 GB
-  Moondream2 INT4 ........ 2.45 GB  |  YOLOv8-seg FP16 ....... ~0.50 GB
-  Whisper V3 Turbo INT8 .. 1.50 GB  |  Kokoro v1.0 INT8 ...... ~0.10 GB
-  Paged KV Cache FP8 ..... 1.15 GB  |  Silero VAD (CPU) ........ 0 GB
-  System Buffer (WSL2) .... 1.50 GB  |  FLUX.1-schnell INT8 ... 4.50 GB
-                                     |  (on-demand, mutually exclusive
-                                     |   with STT+TTS+VLM+CV)
+  Qwen 2.5 7B INT4-AWQ ... 4.30 GB  │  InspireFace FP16 ...... 0.50 GB
+  Moondream2 INT4 ........ 2.45 GB  │  YOLOv8-seg FP16 ....... 0.50 GB
+  Whisper V3 Turbo INT8 .. 1.50 GB  │  Kokoro v1.0 INT8 ...... 0.10 GB
+  Paged KV Cache ......... 1.15 GB  │  WSL2 System Buffer .... 1.50 GB
 
-  Tiers: **minimal** (4 GB) · **balanced** (8 GB) · **standard** (12 GB) · **ultra** (16+ GB)
-  Auto-selected at boot via probeGpu() + selectTier(); override with --profile <tier>
+  **On-Demand Enhancement (not in default budget):**
+  BasicVSR++ FP16 ........ 1.50 GB  │  DTLN FP32 ............. 0.05 GB
 
-  **Dynamic VRAM:** Models not in use are UNLOADED (process SIGTERMed).
-  On lower tiers, modules are spawned on-demand and torn down after use.
-  Process-level CUDA context isolation guarantees zero VRAM fragmentation.
+  **4 Tiers:** minimal (4 GB) · balanced (8 GB) · standard (12 GB) · ultra (16+ GB)
+  Auto-selected via probeGpu() at boot. Override: oe_daemon --profile <tier>
 
-  **No Hardcoded Numbers:** All tuning parameters (timeouts, thresholds,
-  JPEG quality, blur sigma, VAD threshold, max restarts) are read from
-  omniedge_config.yaml. Only architectural constants (port assignments,
-  model architectures, CUDA SM versions) are fixed in code.
-
-  **Microservice Boundary:** Each process owns its own
-  cudaSetDevice(0) context. A CUDA crash in one module
-  cannot corrupt another's context.
+  **Key Architectural Properties:**
+  • Process-per-model (12 binaries): crash isolation + zero VRAM fragmentation
+  • No CUDA MPS: fault isolation requires separate CUDA contexts (MPS → one fault kills all)
+  • No CUDA IPC: cudaIpcGetMemHandle unsupported under WDDM (WSL2)
+  • cudaHostAlloc only: cudaHostRegister unsupported under WDDM
+  • Dual IPC: POSIX SHM (data, zero-copy) + ZeroMQ (control, JSON)
+  • Backend interfaces: swap models via YAML config, no code changes
+  • No hardcoded numbers: omniedge_config.yaml → per-module *_constants.hpp → oe_defaults.hpp
+  • CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;100;120 (Turing→Blackwell) — TRT engines not GPU-portable
 end note
 
 @enduml

@@ -26,7 +26,7 @@ The system's core architecture blueprint had sustained severe formatting defects
 - Recovered multi-line layout for the `export_moondream_onnx.py` script.
 - Reconstructed squashed `CMakeLists.txt` definitions natively.
 - Restored `classDiagram` blocks for Mermaid rendering, ensuring visually parsed representations of `WebSocketBridge`, `OmniEdgeDaemon`, and inference nodes.
-- Re-structured `README.md` in tandem.
+- Re-structured [README.md](README.md) in tandem.
 
 ## 5. Conclusion
-The repository's documentation is now strictly aligned with the source state without syntax loss. The AI coding assistant (Claude) now possesses accurately aligned skill instructions encompassing CMake targets, ZMQ topologies, CUDA orchestration, scaling limitations, and proper model pathings, significantly reducing hallucinations during future codebase expansion. 
+The repository's documentation is now strictly aligned with the source state without syntax loss. The AI coding assistant now possesses accurately aligned skill instructions encompassing CMake targets, ZMQ topologies, CUDA orchestration, scaling limitations, and proper model pathings, significantly reducing hallucinations during future codebase expansion.  
