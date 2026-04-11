@@ -1,0 +1,421 @@
+# ---------------------------------------------------------------------------
+# OmniEdge_AI — Master Configuration
+# ---------------------------------------------------------------------------
+#
+# ─── Model Paths ──────────────────────────────────────────────────────
+# All model paths below are relative to models_root.
+# Set models_root to your local model directory.
+# Default: $HOME/omniedge_models (override via --models-root CLI flag
+# or OE_MODELS_DIR environment variable)
+# ---------------------------------------------------------------------------
+models_root: "${OE_MODELS_DIR:-${HOME}/omniedge_models}"
+
+video_ingest:
+  v4l2_device: "/dev/video0"
+  frame_width: 1920
+  frame_height: 1080
+  pub_port: 5555
+
+audio_ingest:
+  pub_port: 5556
+  vad:
+    model_path: "silero_vad.onnx"              # Silero VAD v5 — CPU-only stateful GRU; gates STT input
+    threshold: 0.5
+    silence_duration_ms: 800
+
+# ---------------------------------------------------------------------------
+# Four-Mode Architecture — GPU Inference Modes
+# ---------------------------------------------------------------------------
+#
+# The system operates in four mutually exclusive GPU inference modes:
+#
+#   1. Conversation (default) — Qwen2.5-Omni-7B / 3B / Gemma 4 E4B
+#      Handles STT+LLM+TTS in a single process (Qwen-Omni variants).
+#      Gemma 4 E4B needs a companion TTS process.
+#
+#   2. Super Resolution — BasicVSR++ temporal video enhancement
+#
+#   3. Image Transform — Stable Diffusion + ControlNet/IP-Adapter
+#
+# Always-on: video_ingest, audio_ingest, background_blur, ISP, ws_bridge
+# ---------------------------------------------------------------------------
+
+# ── Conversation Mode Models ─────────────────────────────────────────────
+# The UI exposes a single model selector dropdown with three options.
+
+conversation_models:
+  # Default: Qwen2.5-7B-Instruct NV-FP4 TRT-LLM engine (text-only).
+  # Uses the working TRT-LLM engine built on this system.
+  # Text-only LLM — needs companion STT and TTS processes.
+  qwen_omni_7b:
+    engine_dir: "trt_engines/qwen2.5-7b-nvfp4"
+    tokenizer_dir: "qwen2.5-7b-instruct-awq"
+    quantization: "nvfp4"
+    max_context_tokens: 2048
+    vram_budget_mib: 3500
+    native_stt: false          # Text-only — needs separate STT (Whisper)
+    native_tts: false          # Text-only — needs companion TTS (Kokoro)
+    native_vision: false
+    zmq_pub_port: 5572
+
+  # Qwen2.5-3B-Instruct AWQ — smaller model for constrained platforms.
+  # Installed by install.sh (downloads pre-quantized AWQ, builds TRT-LLM engine).
+  qwen_omni_3b:
+    engine_dir: "trt_engines/qwen2.5-3b-awq"
+    tokenizer_dir: "qwen2.5-3b-instruct-awq"
+    quantization: "awq"
+    max_context_tokens: 2048
+    vram_budget_mib: 2000
+    native_stt: false          # Text-only — needs separate STT
+    native_tts: false          # Text-only — needs companion TTS
+    native_vision: false
+    zmq_pub_port: 5572
+
+  # Gemma 4 E4B — accepts audio buffers and image frames as native input.
+  # Installed by install.sh (downloads from HuggingFace, builds TRT-LLM engine).
+  gemma_e4b:
+    engine_dir: "trt_engines/gemma-4-e4b"
+    tokenizer_dir: "gemma-4-e4b"
+    quantization: "none"
+    max_context_tokens: 4096
+    vram_budget_mib: 3000
+    native_stt: true           # Accepts audio buffers natively
+    native_tts: false          # No audio output — needs companion TTS
+    native_vision: true        # Accepts image frames natively
+    zmq_pub_port: 5572
+
+# Active conversation model at boot (one of: qwen_omni_7b, qwen_omni_3b, gemma_e4b)
+default_conversation_model: "qwen_omni_7b"
+
+# ── TTS (companion for Gemma 4 E4B only) ─────────────────────────────────
+# When Gemma 4 E4B is selected, the UI reveals an additional TTS model selector.
+tts:
+  onnx_model: "kokoro-onnx/onnx/model_int8.onnx"  # Kokoro v1.0 INT8 ONNX — 82M param TTS; <100 MB VRAM
+  voice_dir: "kokoro/voices"
+  default_voice: "af_heart"
+  speed: 1.0
+  shm_output: "/oe.aud.tts"
+  zmq_pub_port: 5565
+
+# ── Legacy separate AI modules (backward compatibility) ──────────────────
+# These are used when running in standalone mode without the unified
+# conversation model.  The four-mode architecture prefers the unified model.
+
+stt:
+  encoder_engine: "trt_engines/whisper-turbo/encoder"
+  decoder_engine: "trt_engines/whisper-turbo/decoder"
+  tokenizer_dir: "whisper-large-v3-turbo"
+  zmq_pub_port: 5563
+  shm_input: "/oe.aud.ingest"
+
+llm:
+  engine_dir: "trt_engines/qwen2.5-7b-nvfp4"
+  tokenizer_dir: "qwen2.5-7b-instruct-awq"
+  max_context_tokens: 2048
+  kv_cache_dtype: "fp8"
+  zmq_pub_port: 5561
+
+background_blur:
+  engine_path: "trt_engines/yolov8n-seg-416.engine"  # YOLOv8n-seg TRT FP16 engine — 3.2M param; ~0.25 GB VRAM (416×416 input)
+  input_size: 416                                     # Input resolution for TRT engine (must match engine build)
+  shm_input: "/oe.vid.ingest"
+  shm_output: "/oe.cv.blur.jpeg"
+  jpeg_quality: 85
+  blur_kernel_size: 51
+  blur_sigma: 25.0
+  cuda_stream_priority: 0
+  zmq_pub_port: 5567
+
+face_recognition:
+  # Model variant: scrfd_adaface_101 (default), scrfd_adaface_50, scrfd_mobilefacenet, inspireface
+  model_variant: "scrfd_adaface_101"
+  # Directory containing detector.onnx + recognizer.onnx (ONNX variants),
+  # or InspireFace TRT model pack path (inspireface variant).
+  model_pack_path: "face_models/scrfd_adaface_101"
+  shm_input: "/oe.vid.ingest"
+  recognition_threshold: 0.45
+  faces_db: "./data/known_faces.sqlite"
+  frame_subsample: 3
+  cuda_stream_priority: 0
+  zmq_pub_port: 5566
+
+face_filter:
+  model_path: "facemesh/face_landmarks_detector.onnx"  # FaceMesh V2 ONNX — 478 3D landmarks; ~30 MB VRAM
+  filter_manifest: "assets/filters/manifest.json"       # Filter asset manifest (textures + UV maps)
+  shm_input: "/oe.vid.ingest"
+  shm_output: "/oe.cv.facefilter.jpeg"
+  jpeg_quality: 85
+  active_filter: ""                                     # Empty = passthrough at boot
+  enabled: false                                        # Disabled until user toggles on
+  cuda_stream_priority: 0
+  zmq_pub_port: 5575
+
+# ---------------------------------------------------------------------------
+# SAM2 — Segment Anything Model 2 (interactive segmentation)
+# ---------------------------------------------------------------------------
+# On-demand module: user clicks a point or draws a box on the video canvas,
+# SAM2 produces a pixel-perfect segmentation mask. Two-stage ONNX inference:
+# image encoder (ViT backbone, ~700 MiB) + mask decoder (lightweight, ~20ms).
+# VRAM: ~800 MiB total. Spawned on first use, unloaded on mode switch.
+
+sam2:
+  encoder_model: "sam2/sam2_hiera_tiny_encoder.onnx"
+  decoder_model: "sam2/sam2_hiera_tiny_decoder.onnx"
+  shm_input: "/oe.vid.ingest"
+  shm_output: "/oe.cv.sam2.mask"
+  jpeg_quality: 90
+  enabled: false
+  cuda_stream_priority: 0
+  zmq_pub_port: 5576
+
+# ---------------------------------------------------------------------------
+# Super Resolution Mode — BasicVSR++ temporal video enhancement
+# ---------------------------------------------------------------------------
+# Spawns BasicVSR++ using the always-on video ingest SHM feed.
+# All conversation models and image transform processes are killed.
+# The UI presents frame and clip selection controls.
+
+super_resolution:
+  onnx_model: "basicvsrpp/basicvsrpp_denoise.onnx"  # BasicVSR++ ONNX — temporal video enhancer; ~1.5 GB VRAM
+  shm_input: "/oe.vid.ingest"
+  shm_output: "/oe.vid.sr"
+  temporal_window: 5
+  cuda_stream_priority: -1
+  zmq_pub_port: 5573
+
+# Legacy alias for backward compatibility
+video_denoise:
+  onnx_model: "basicvsrpp/basicvsrpp_denoise.onnx"
+  shm_input: "/oe.vid.ingest"
+  shm_output: "/oe.vid.denoise"
+  temporal_window: 5
+  cuda_stream_priority: -1
+  zmq_pub_port: 5568
+
+# ---------------------------------------------------------------------------
+# Image Transform Mode — Stable Diffusion + ControlNet/IP-Adapter
+# ---------------------------------------------------------------------------
+# Structure-preserving style transfer.  User uploads an image and selects a
+# style (cat, anime, cartoon, etc.).  The image is sent over ZMQ with the
+# style selection, the FSM transitions to ImageTransform state, the inference
+# module runs diffusion with the selected adapter, and the result is
+# published back to the UI.
+#
+# InstantStyle and IP-Adapter FaceID are used for turning people into animals
+# or applying artistic styles while preserving pose and structure.
+
+image_transform:
+  model_dir: "stable-diffusion"
+  controlnet_model: "controlnet-canny"
+  ip_adapter_model: "ip-adapter-faceid"
+  instantstyle_model: "instantstyle"
+  available_styles:
+    - "cat"
+    - "anime"
+    - "cartoon"
+    - "oil_painting"
+    - "watercolor"
+  default_style: "anime"
+  inference_steps: 30
+  guidance_scale: 7.5
+  shm_input: "/oe.vid.ingest"
+  zmq_pub_port: 5574
+
+# ---------------------------------------------------------------------------
+# Audio denoise — optional toggle in Conversation mode
+# ---------------------------------------------------------------------------
+# When enabled, inserts an audio cleanup stage in the pipeline before the
+# conversation model receives audio input, reducing background noise for
+# more accurate speech understanding.
+
+audio_denoise:
+  model_stage1: "dtln/dtln_1.onnx"  # DTLN stage-1 — STFT domain LSTM masking; ~2.5 MB
+  model_stage2: "dtln/dtln_2.onnx"  # DTLN stage-2 — time domain waveform refinement; ~2.5 MB
+  shm_input: "/oe.aud.ingest"
+  shm_output: "/oe.aud.denoise"
+  cuda_stream_priority: 0
+  zmq_pub_port: 5569
+
+websocket_bridge:
+  ws_port: 9001
+  frontend_dir: "./frontend"
+  zmq_pub_port: 5570
+
+daemon:
+  zmq_pub_port: 5571
+  watchdog_poll_ms: 1000
+  module_ready_timeout_s: 15
+  restart_base_backoff_ms: 500
+  restart_max_backoff_ms: 30000
+  state_machine:
+    vad_silence_threshold_ms: 800
+    barge_in_enabled: true
+    llm_generation_timeout_s: 60
+  heartbeat:
+    ivl_ms: 1000
+    timeout_ms: 30000
+    ttl_ms: 10000
+  zmq_sub:
+    - "ipc:///tmp/omniedge_5570"   # ws_bridge
+    - "ipc:///tmp/omniedge_5555"   # video_ingest
+    - "ipc:///tmp/omniedge_5556"   # audio_ingest
+    - "ipc:///tmp/omniedge_5561"   # llm (legacy)
+    - "ipc:///tmp/omniedge_5563"   # stt (legacy)
+    - "ipc:///tmp/omniedge_5565"   # tts
+    - "ipc:///tmp/omniedge_5566"   # face_recognition
+    - "ipc:///tmp/omniedge_5567"   # background_blur
+    - "ipc:///tmp/omniedge_5568"   # video_denoise (legacy)
+    - "ipc:///tmp/omniedge_5569"   # audio_denoise
+    - "ipc:///tmp/omniedge_5572"   # conversation_model (Qwen-Omni / Gemma)
+    - "ipc:///tmp/omniedge_5573"   # super_resolution (BasicVSR++)
+    - "ipc:///tmp/omniedge_5574"   # image_transform (Stable Diffusion)
+    - "ipc:///tmp/omniedge_5575"   # face_filter (FaceMesh AR)
+    - "ipc:///tmp/omniedge_5576"   # sam2 (Segment Anything Model 2)
+
+# ---------------------------------------------------------------------------
+# Module definitions — daemon looks up modules[name].binary + args
+# ---------------------------------------------------------------------------
+#
+# Four-mode architecture:
+#   Always-on:  video_ingest, audio_ingest, background_blur, ws_bridge
+#   Conversation (default): conversation_model (unified STT+LLM+TTS)
+#   On-demand (UI toggle): tts (Gemma companion), audio_denoise
+#   Mode-switched: super_resolution, image_transform
+#   Legacy:    llm, stt, face_recognition, video_denoise
+# ---------------------------------------------------------------------------
+modules:
+  # ── Always-on modules (resident across ALL modes) ──────────────────────
+  ws_bridge:
+    binary: "./build/modules/nodes/ws_bridge/omniedge_ws_bridge"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5570"
+    max_restarts: 5
+
+  video_ingest:
+    binary: "./build/modules/nodes/ingest/omniedge_video_ingest"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5555"
+    max_restarts: 5
+
+  audio_ingest:
+    binary: "./build/modules/nodes/ingest/omniedge_audio_ingest"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5556"
+    max_restarts: 5
+
+  background_blur:
+    binary: "./build/modules/nodes/cv/omniedge_bg_blur"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5567"
+    max_restarts: 5
+
+  # ── Conversation mode — unified model (default: Qwen2.5-Omni-7B) ──────
+  # Both Qwen 2.5-Omni variants handle STT+LLM+TTS natively in a single
+  # process — no separate STT or TTS modules are spawned.
+  # Gemma 4 E4B accepts audio+image natively but needs companion TTS.
+  # Switching between conversation models follows the same kill-spawn cycle.
+  conversation_model:
+    binary: "./build/modules/nodes/llm/omniedge_llm"
+    args: ["--config", "config/omniedge_config.yaml", "--model", "qwen_omni_7b"]
+    zmq_pub: "ipc:///tmp/omniedge_5572"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # TTS companion — only spawned when Gemma 4 E4B is selected
+  tts:
+    binary: "./build/modules/nodes/tts/omniedge_tts"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5565"
+    max_restarts: 3
+
+  # Audio denoise — optional toggle in Conversation mode
+  audio_denoise:
+    binary: "./build/modules/nodes/audio_denoise/omniedge_audio_denoise"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5569"
+    max_restarts: 3
+
+  # ── Super Resolution mode — BasicVSR++ ─────────────────────────────────
+  # Spawns BasicVSR++ for temporal video enhancement using always-on video
+  # ingest SHM feed.  All conversation models and image transform killed.
+  super_resolution:
+    binary: "./build/modules/nodes/cv/omniedge_super_resolution"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5573"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # ── Image Transform mode — Stable Diffusion + ControlNet/IP-Adapter ────
+  # Structure-preserving style transfer (cat, anime, cartoon, etc.).
+  # InstantStyle and IP-Adapter FaceID for turning people into animals
+  # or applying artistic styles while preserving pose and structure.
+  image_transform:
+    binary: "./build/modules/nodes/cv/omniedge_image_transform"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5574"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # ── Face filter AR (always-on, lightweight) ─────────────────────────────
+  face_filter:
+    binary: "./build/modules/nodes/cv/omniedge_face_filter"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5575"
+    max_restarts: 5
+
+  # ── SAM2 interactive segmentation (on-demand, user-triggered) ────────
+  sam2:
+    binary: "./build/modules/nodes/cv/omniedge_sam2"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5576"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  # ── Legacy separate modules (backward compatibility) ───────────────────
+  face_recognition:
+    binary: "./build/modules/nodes/cv/omniedge_face_recog"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5566"
+    max_restarts: 5
+
+  stt:
+    binary: "./build/modules/nodes/stt/omniedge_stt"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5563"
+    max_restarts: 3
+
+  llm:
+    binary: "./build/modules/nodes/llm/omniedge_llm"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5561"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+  video_denoise:
+    binary: "./build/modules/nodes/cv/omniedge_video_denoise"
+    args: ["--config", "config/omniedge_config.yaml"]
+    zmq_pub: "ipc:///tmp/omniedge_5568"
+    max_restarts: 3
+    env:
+      CUDA_VISIBLE_DEVICES: "0"
+
+# ---------------------------------------------------------------------------
+# Launch Order — daemon spawns these modules at boot in this order
+# ---------------------------------------------------------------------------
+#
+# Always-on modules launch at boot.  The default conversation model
+# (Qwen2.5-Omni-7B) launches as the initial heavy GPU process.
+# Super Resolution, Image Transform, and companion TTS are NOT in
+# launch_order — they are spawned on-demand via mode switch or UI toggle.
+#
+# ws_bridge is NOT listed — run_all.sh launches it separately.
+launch_order:
+  - video_ingest
+  - audio_ingest
+  - conversation_model
+  - background_blur
