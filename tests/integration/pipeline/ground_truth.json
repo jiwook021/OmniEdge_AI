@@ -1,0 +1,76 @@
+{
+    "audio_tests": [
+        {
+            "file": "data/test_hello_world.raw",
+            "format": "pcm_s16le_16khz_mono",
+            "expected_text": "Hello world.",
+            "tolerance": 0.8,
+            "description": "Simple English phrase for STT baseline"
+        },
+        {
+            "file": "data/test_turn_on_lights.raw",
+            "format": "pcm_s16le_16khz_mono",
+            "expected_text": "Turn on the lights.",
+            "tolerance": 0.7,
+            "description": "Voice command for home automation"
+        },
+        {
+            "file": "data/test_silence_2s.raw",
+            "format": "pcm_s16le_16khz_mono",
+            "expected_text": "",
+            "tolerance": 1.0,
+            "description": "Pure silence — VAD should reject, STT should return empty"
+        }
+    ],
+    "video_tests": [
+        {
+            "file": "data/test_person_640x480.bgr24",
+            "width": 640,
+            "height": 480,
+            "format": "bgr24_raw",
+            "expected_yolo_person": true,
+            "description": "Single person in frame for MediaPipe Selfie Seg"
+        },
+        {
+            "file": "data/test_empty_room_640x480.bgr24",
+            "width": 640,
+            "height": 480,
+            "format": "bgr24_raw",
+            "expected_yolo_person": false,
+            "description": "Empty room — no person detection expected"
+        }
+    ],
+    "llm_tests": [
+        {
+            "prompt": "What is 2 + 2? Answer with just the number.",
+            "expected_contains": ["4"],
+            "max_tokens": 32,
+            "description": "Trivial arithmetic sanity check"
+        },
+        {
+            "prompt": "Say hello in one word.",
+            "expected_contains": ["hello", "Hello", "Hi"],
+            "max_tokens": 16,
+            "description": "Minimal generation test"
+        }
+    ],
+    "tts_tests": [
+        {
+            "text": "Hello, this is a test.",
+            "voice": "af_heart",
+            "min_samples": 10000,
+            "max_samples": 500000,
+            "sample_rate_hz": 24000,
+            "description": "Basic TTS synthesis — verify non-empty PCM output"
+        }
+    ],
+    "performance_budgets": {
+        "whisper_latency_ms": 3000,
+        "gemma_ttft_ms": 300,
+        "gemma_full_generation_ms": 10000,
+        "kokoro_latency_ms": 5000,
+        "yolo_latency_ms": 50,
+        "vad_latency_ms": 5,
+        "total_vram_bytes": 12884901888
+    }
+}
